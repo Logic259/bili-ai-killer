@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "B站 AI 评论净化器 (Bili-AI-Killer)",
   "short_name": "Bili-AI-Killer",
-  "version": "1.0.0",
-  "description": "精准识别并彻底屏蔽 B 站评论区接入 DeepSeek 的大肥鱼/鲸鱼娘挂机号、签名自曝 Agent、伪装路人锐评腔与 @AI 召唤刷屏。",
+  "version": "3.0.0",
+  "description": "精准识别并彻底屏蔽 B 站评论区接入 DeepSeek 的大肥鱼/哦鲸鲸挂机号、签名自曝 Agent、伪口语双簧腔与 @AI 召唤刷屏。",
   "permissions": [
     "storage",
     "activeTab"
@@ -45,6 +45,8 @@
       "js": [
         "core/rules.js",
         "core/detector.js",
+        "content/api-sniffer.js",
+        "content/dom-extractor.js",
         "content/injected-main.js"
       ],
       "run_at": "document_start",

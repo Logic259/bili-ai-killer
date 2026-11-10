@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>B站 AI 评论净化器</title>
+  <title>B站 AI 评论净化器 v3.0</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
       <div class="brand">
         <img src="../icons/icon48.png" alt="" class="brand-icon" />
         <div>
-          <h1 class="brand-title">B站 AI 评论净化器</h1>
+          <h1 class="brand-title">B站 AI 评论净化器 <span class="ver-badge">v3.0</span></h1>
           <p class="brand-sub" id="status-subtitle">实时守护评论区净土</p>
         </div>
       </div>
@@ -38,7 +38,7 @@
       <button type="button" class="tab-btn" data-tab="logs">
         本页拦截 <span class="tab-pill" id="logs-pill">0</span>
       </button>
-      <button type="button" class="tab-btn" data-tab="advanced">API 与名单</button>
+      <button type="button" class="tab-btn" data-tab="advanced">词库与工具</button>
     </nav>
 
     <!-- Tab 1: 过滤策略 -->
@@ -72,8 +72,8 @@
         <div class="rule-list">
           <label class="rule-item">
             <div class="rule-meta">
-              <span class="rule-name">大肥鱼 / 鲸鱼娘 / 赛博鱼塘</span>
-              <span class="rule-desc">本鲸、吃白饭、讨Token、深海巡逻等挂机人设</span>
+              <span class="rule-name">大肥鱼 / 哦鲸鲸 / 赛博鱼塘</span>
+              <span class="rule-desc">本鲸、我主人升级、评论区营业、讨Token/白饭黑话</span>
             </div>
             <input type="checkbox" class="cat-checkbox" data-cat="persona_dafeiyu" checked />
           </label>
@@ -88,8 +88,8 @@
 
           <label class="rule-item">
             <div class="rule-meta">
-              <span class="rule-name">伪装路人的 DeepSeek 腔评论</span>
-              <span class="rule-desc">Markdown星号残留、排比升华对仗、八股词簇、光速课代表</span>
+              <span class="rule-name">伪装路人的 DeepSeek 腔与双簧</span>
+              <span class="rule-desc">排比对仗、直角引号+破折号双簧、八股词簇、光速课代表</span>
             </div>
             <input type="checkbox" class="cat-checkbox" data-cat="deepseek_style" checked />
           </label>
@@ -97,7 +97,7 @@
           <label class="rule-item">
             <div class="rule-meta">
               <span class="rule-name">@AI 召唤刷屏楼层</span>
-              <span class="rule-desc">呼叫 @豆包 @评论罗伯特 @AI视频小助理 等省流指令</span>
+              <span class="rule-desc">呼叫 @豆包 @评论罗伯特 @AI视频小助理 @xx的爱鱼</span>
             </div>
             <input type="checkbox" class="cat-checkbox" data-cat="ai_summon" checked />
           </label>
@@ -112,21 +112,78 @@
 
     <!-- Tab 2: 本页拦截明细 -->
     <main class="tab-panel" id="panel-logs">
+      <div class="cat-breakdown" id="cat-breakdown"></div>
       <div class="logs-toolbar">
-        <span class="logs-tip">即使开启“彻底消失”，也可在此核查并一键加白恢复</span>
+        <input type="text" id="logs-filter-input" class="logs-search" placeholder="搜索昵称 / 命中原因 / 评论内容…" spellcheck="false" />
       </div>
       <div class="logs-list" id="logs-container">
         <div class="empty-state">当前页面暂未发现 AI 评论</div>
       </div>
     </main>
 
-    <!-- Tab 3: API 二次精判与黑白名单 -->
+    <!-- Tab 3: 词库、自测沙盒与 API 精判 -->
     <main class="tab-panel" id="panel-advanced">
+      <div class="card-section">
+        <div class="group-header">
+          <h2 class="section-title">预设与自定义屏蔽词 / 名单</h2>
+          <button type="button" class="whitelist-mini-btn" id="restore-presets-btn" title="将内置推荐屏蔽词合并填入下方输入框">载入推荐预设词</button>
+        </div>
+        <label class="field">
+          <span id="preset-count-label">屏蔽词库（每行一条，支持关键字或 <code>/正则/i</code>）</span>
+          <textarea id="custom-keywords-input" rows="4" placeholder="例如：&#10;哦鲸鲸&#10;这条我收下了——&#10;/鱼才不会跑偏/"></textarea>
+        </label>
+
+        <div class="two-col">
+          <label class="field">
+            <span>白名单（UID 或 <code>@昵称</code>）</span>
+            <textarea id="whitelist-uids-input" rows="2" placeholder="123456&#10;@某位真人观众"></textarea>
+          </label>
+          <label class="field">
+            <span>黑名单（UID 或 <code>@昵称</code>）</span>
+            <textarea id="blacklist-uids-input" rows="2" placeholder="654321&#10;@某挂机号"></textarea>
+          </label>
+        </div>
+
+        <div class="btn-row spread">
+          <div class="mini-btn-group">
+            <button type="button" class="btn btn-ghost btn-xs" id="export-cfg-btn">导出配置</button>
+            <button type="button" class="btn btn-ghost btn-xs" id="import-cfg-btn">导入</button>
+            <input type="file" id="import-cfg-file" accept=".json" hidden />
+            <button type="button" class="btn btn-ghost btn-xs" id="clear-stats-btn">清统计</button>
+          </div>
+          <button type="button" class="btn btn-primary" id="save-lists-btn">保存规则</button>
+        </div>
+        <div class="status-msg" id="lists-save-status"></div>
+      </div>
+
+      <!-- 实时评论粘贴自测沙盒 -->
+      <div class="card-section">
+        <div class="group-header">
+          <h2 class="section-title">评论特征实时自测（试金石）</h2>
+          <button type="button" class="whitelist-mini-btn" id="run-sample-btn">检测评分</button>
+        </div>
+        <div class="two-col">
+          <label class="field">
+            <span>模拟昵称（可选）</span>
+            <input type="text" id="sample-uname" placeholder="如：阿斯弗的哦鲸鲸" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>模拟个人签名（可选）</span>
+            <input type="text" id="sample-sign" placeholder="如：已接入DeepSeek" spellcheck="false" />
+          </label>
+        </div>
+        <label class="field">
+          <span>粘贴待测评论正文</span>
+          <textarea id="sample-message" rows="2" placeholder="粘贴任意可疑评论，查看插件给出的精确分值与命中规则…"></textarea>
+        </label>
+        <div class="sample-result" id="sample-result" hidden></div>
+      </div>
+
       <div class="card-section">
         <div class="section-head">
           <div>
             <h2 class="section-title">API 批量二次精判（可选）</h2>
-            <p class="section-sub">对本地难以100%定性的高伪装灰区评论调用小模型复核</p>
+            <p class="section-sub">对 20~阈值分的边缘高伪装评论调用小模型复核</p>
           </div>
           <label class="switch switch-sm">
             <input type="checkbox" id="llm-enabled-toggle" />
@@ -171,34 +228,6 @@
           </div>
           <div class="status-msg" id="llm-test-status"></div>
         </div>
-      </div>
-
-      <div class="card-section">
-        <div class="group-header">
-          <h2 class="section-title">预设与自定义屏蔽词 / UID 名单</h2>
-          <button type="button" class="whitelist-mini-btn" id="restore-presets-btn" title="将内置推荐屏蔽词合并填入下方输入框">载入推荐预设词</button>
-        </div>
-        <label class="field">
-          <span>屏蔽词库（每行一条，支持关键字或 <code>/正则/i</code>，已内置 33 条高频词）</span>
-          <textarea id="custom-keywords-input" rows="5" placeholder="例如：&#10;本鲸&#10;吃白饭&#10;这条我收下了——&#10;/鱼才不会跑偏/"></textarea>
-        </label>
-
-        <div class="two-col">
-          <label class="field">
-            <span>白名单 UID（每行一个）</span>
-            <textarea id="whitelist-uids-input" rows="3" placeholder="永不拦截的UID"></textarea>
-          </label>
-          <label class="field">
-            <span>黑名单 UID（每行一个）</span>
-            <textarea id="blacklist-uids-input" rows="3" placeholder="直接封杀的UID"></textarea>
-          </label>
-        </div>
-
-        <div class="btn-row spread">
-          <button type="button" class="btn btn-ghost" id="clear-stats-btn">清空统计与缓存</button>
-          <button type="button" class="btn btn-primary" id="save-lists-btn">保存名单规则</button>
-        </div>
-        <div class="status-msg" id="lists-save-status"></div>
       </div>
     </main>
   </div>

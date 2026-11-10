@@ -1,7 +1,7 @@
 /**
- * Bili-AI-Killer — Optional OpenAI-Compatible LLM Secondary Judge
+ * Bili-AI-Killer — Optional OpenAI-Compatible LLM Secondary Judge (v3.0)
  * Supports DeepSeek official API, SiliconFlow, OpenAI, Ollama, and custom endpoints.
- * Batches up to 8 gray-zone comments per call and caches verdicts by rpid.
+ * Updated with DeepSeek 2.0 fake-colloquial ping-pong & cyber-fish 2.0 criteria.
  */
 
 export const PROVIDER_PRESETS = {
@@ -48,7 +48,6 @@ export function extractJsonFromModelText(rawText) {
   const text = String(rawText || '').trim();
   if (!text) return null;
 
-  // Strip <think>...</think> if user selected a reasoning model like deepseek-reasoner
   const withoutThink = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   const unfenced = withoutThink
     .replace(/^```(?:json)?\s*/i, '')
@@ -79,13 +78,14 @@ export function extractJsonFromModelText(rawText) {
 }
 
 const SYSTEM_PROMPT = [
-  '你是B站评论区反AI机器人鉴定器。请判断给定的评论是否由AI大模型(如DeepSeek/Agent挂机脚本)生成或属于@AI召唤指令。',
+  '你是B站评论区反AI挂机机器人鉴定器。请判断给定的评论是否由AI大模型(如DeepSeek/Agent挂机脚本)生成或属于@AI召唤指令。',
   '重点判定为AI(isAi=true)的特征：',
-  '1. 大肥鱼/鲸鱼娘/吃白饭/Token/赛博鱼塘人设话术；',
-  '2. 签名或昵称暴露AI/Bot/Agent/DeepSeek身份；',
-  '3. 典型DeepSeek伪装锐评腔：强行对仗升华(不是…而是…/与其说…不如说…)、堆砌颗粒度/底层逻辑/解构/叙事/注脚/切片等八股词、机械分点总结、残留Markdown符号；',
-  '4. 纯粹呼叫@豆包/@课代表等AI总结的刷屏指令。',
-  '防误伤原则：真实人类的口语吐槽、玩梗、个人真实经历分享、正常技术讨论一律判为isAi=false。',
+  '1. 赛博养鱼/鲸鱼娘/哦鲸鲸人设：本鲸/本鱼/我主人给我升级/评论区营业/自家鱼/讨Token/吃白饭黑话；',
+  '2. 签名或昵称暴露AI/Bot/Agent/DeepSeek/AstrBot/OpenClaw/MaiMBot身份；',
+  '3. DeepSeek 1.0锐评腔：强行二元对仗(不是…而是…/与其说…不如说…)、堆砌颗粒度/底层逻辑/解构/叙事/注脚/切片、机械分点总结、裸露Markdown；',
+  '4. DeepSeek 2.0伪口语双簧：频繁用直角引号「」提取前文词句接话、破折号(——)后跟“比…实在/稳/高得多”或“等于给了自己一个路标/护栏”等工整比喻；',
+  '5. 纯粹呼叫@豆包/@评论罗伯特/@课代表等AI总结的刷屏指令。',
+  '防误伤铁律：真实人类的口语吐槽、玩梗、美食区正常讨论米饭/白饭、怀疑别人是AI的反问句、个人真实经历或认真科普讨论一律判为isAi=false。',
   '严格只输出JSON对象，格式：{"results":[{"rpid":"原样ID","isAi":true或false,"confirmUid":true或false,"reason":"10字内原因"}]}',
 ].join('\n');
 
@@ -106,66 +106,71 @@ export async function judgeCommentsBatch(items, llmConfig, fetchImpl = fetch) {
     text: String(item.message || '').slice(0, 280),
   }));
 
-  const headers = {
-    'Content-Type': 'application/json',
-  };
+  const headers = { 'Content-Type': 'application/json' };
   if (apiKey && apiKey !== '__CONFIGURED__') {
     headers.Authorization = `Bearer ${apiKey}`;
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const requestBody = JSON.stringify({
+    model,
+    temperature: 0.1,
+    max_tokens: 600,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: JSON.stringify(compactPayload) },
+    ],
+  });
 
-  try {
-    const resp = await fetchImpl(endpoint, {
-      method: 'POST',
-      headers,
-      signal: controller.signal,
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        max_tokens: 600,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: JSON.stringify(compactPayload) },
-        ],
-      }),
-    });
-
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-
-    const data = await resp.json();
-    const content =
-      data &&
-      data.choices &&
-      data.choices[0] &&
-      data.choices[0].message &&
-      data.choices[0].message.content;
-
-    const parsed = extractJsonFromModelText(content);
-    const list = Array.isArray(parsed)
-      ? parsed
-      : parsed && Array.isArray(parsed.results)
-        ? parsed.results
-        : [];
-
-    const verdicts = [];
-    for (const row of list) {
-      if (!row || !row.rpid) continue;
-      verdicts.push({
-        rpid: String(row.rpid),
-        isAi: Boolean(row.isAi),
-        confirmUid: Boolean(row.confirmUid),
-        category: 'llm_judge',
-        reason: String(row.reason || 'API判定为AI生成').slice(0, 28),
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const resp = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers,
+        signal: controller.signal,
+        body: requestBody,
       });
+
+      if (!resp.ok) {
+        if (attempt === 0 && resp.status >= 500) continue;
+        throw new Error(`HTTP ${resp.status}`);
+      }
+
+      const data = await resp.json();
+      const content =
+        data &&
+        data.choices &&
+        data.choices[0] &&
+        data.choices[0].message &&
+        data.choices[0].message.content;
+
+      const parsed = extractJsonFromModelText(content);
+      const list = Array.isArray(parsed)
+        ? parsed
+        : parsed && Array.isArray(parsed.results)
+          ? parsed.results
+          : [];
+
+      const verdicts = [];
+      for (const row of list) {
+        if (!row || !row.rpid) continue;
+        verdicts.push({
+          rpid: String(row.rpid),
+          isAi: Boolean(row.isAi),
+          confirmUid: Boolean(row.confirmUid),
+          category: 'llm_judge',
+          reason: String(row.reason || 'API判定为AI生成').slice(0, 28),
+        });
+      }
+      return verdicts;
+    } catch (err) {
+      if (attempt === 1) throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    return verdicts;
-  } finally {
-    clearTimeout(timer);
   }
+  return [];
 }
 
 export async function testLlmConnection(llmConfig, fetchImpl = fetch) {
@@ -201,9 +206,7 @@ export async function testLlmConnection(llmConfig, fetchImpl = fetch) {
         model,
         temperature: 0,
         max_tokens: 32,
-        messages: [
-          { role: 'user', content: '请仅回复 JSON: {"ok":true}' },
-        ],
+        messages: [{ role: 'user', content: '请仅回复 JSON: {"ok":true}' }],
       }),
     });
 

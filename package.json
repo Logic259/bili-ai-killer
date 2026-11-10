@@ -1,6 +1,6 @@
 {
   "name": "bili-ai-killer",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "description": "B站 AI 评论净化器 — 精准识别并屏蔽 Bilibili 评论区的 DeepSeek 挂机机器人、大肥鱼/哦鲸鲸人设号、Agent 自曝号与伪口语双簧评论",
   "private": false,
   "scripts": {

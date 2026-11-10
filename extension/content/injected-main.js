@@ -1,10 +1,7 @@
 /**
- * Bili-AI-Killer — MAIN World Controller (v2.1 Non-Intrusive & Deep-Scan Fixed)
- * Key Guarantees:
- *  1. ZERO Element.prototype.attachShadow hijacking — never interrupts LitElement constructors.
- *  2. Separate ensureObserved() vs scanBiliCommentsTree() so deep Shadow DOM rescanning NEVER short-circuits.
- *  3. Author profile extraction strictly scoped to bili-comment-user-info (never confused by @mentions in rich text).
- *  4. User-level cache (userByUid / userByUname) links API member.sign to DOM nodes even when rpid is absent.
+ * Bili-AI-Killer — MAIN World Controller & Time-Sliced Scheduler (v3.0)
+ * Coordinates passive API indexer, targeted Shadow DOM extractor, Constructable Stylesheet
+ * collapse banners, cross-tab bot memory, and frame-budgeted evaluation.
  */
 (function initMainWorld() {
   'use strict';
@@ -19,20 +16,21 @@
 
   const core = window.__BAK_CORE__ || {};
   const detector = core.detector;
+  const sniffer = core.sniffer;
+  const domExtractor = core.domExtractor;
   try {
     delete window.__BAK_CORE__;
   } catch (_e) {
     // ignore
   }
 
-  if (!detector) return;
+  if (!detector || !sniffer || !domExtractor) return;
 
   const EVT_TO_MAIN = 'bak:bridge-to-main';
   const EVT_TO_ISOLATED = 'bak:main-to-bridge';
 
   let currentSettings = detector.normalizeSettings(detector.DEFAULT_SETTINGS);
   let settingsEpoch = 1;
-  let apiEpoch = 1;
 
   const pageContext = {
     currentUserUid: '',
@@ -41,18 +39,20 @@
     confirmedBotUids: new Set(),
   };
 
-  const MAX_META_CACHE = 4000;
-  const metaByRpid = new Map();
-  const metaByFingerprint = new Map();
-  const userByUid = new Map(); // uid -> { uid, uname, sign }
-  const userByUname = new Map(); // uname -> { uid, uname, sign }
   const llmVerdictByRpid = new Map();
   const pendingLlmRpids = new Set();
+  const syncedBotIdentities = new Set();
 
-  // Map<HTMLElement, { rendererEl, parentThreadEl, isThread, meta, identityKey, lastEvalKey, lastResult }>
+  // Map<HTMLElement, TrackedEntry>
   const trackedHosts = new Map();
   const blockedLogRpidSet = new Set();
   const observedRoots = new WeakSet();
+
+  const api = sniffer.createApiIndexer(pageContext, () => {
+    scheduleReevaluateTracked(true);
+    setTimeout(() => scheduleReevaluateTracked(true), 140);
+  });
+  api.installNetworkProxies(window);
 
   function sendToBridge(type, payload = {}) {
     try {
@@ -63,27 +63,10 @@
     }
   }
 
-  function lruSet(map, key, val, maxSize = MAX_META_CACHE) {
-    if (!key) return;
-    if (map.has(key)) map.delete(key);
-    map.set(key, val);
-    if (map.size > maxSize) {
-      const oldestKey = map.keys().next().value;
-      map.delete(oldestKey);
-    }
-  }
-
-  function normalizeSnippet(str) {
-    return String(str || '')
-      .replace(/^回复\s*@[^:：\s]+\s*[：:]\s*/, '')
-      .replace(/\s+/g, '')
-      .slice(0, 36);
-  }
-
   function getMetaIdentityKey(meta) {
     if (!meta) return '';
     if (meta.rpid) return `r:${meta.rpid}`;
-    return `f:${meta.uid || meta.uname || ''}|${normalizeSnippet(meta.message)}`;
+    return `f:${meta.uid || meta.uname || ''}|${sniffer.normalizeSnippet(meta.message)}`;
   }
 
   function refreshInitialStateContext() {
@@ -115,461 +98,70 @@
     }
   }
 
-  function indexRawReplyObject(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-    const rpid = String(raw.rpid_str || raw.rpid || '').trim();
-    const member = raw.member || {};
-    const content = raw.content || {};
-    const uid = String(member.mid || raw.mid_str || raw.mid || '').trim();
-    const uname = String(member.uname || '').trim();
-    const sign = String(member.sign || '').trim();
-    const message = String(content.message || '').trim();
-    const ctime = Number(raw.ctime) || 0;
-
-    if (uid || uname) {
-      const profileEntry = { uid, uname, sign };
-      if (uid) lruSet(userByUid, uid, profileEntry);
-      if (uname) lruSet(userByUname, uname, profileEntry);
-    }
-
-    const atNames = [];
-    if (Array.isArray(content.members)) {
-      for (const m of content.members) {
-        if (m && m.uname) atNames.push(String(m.uname));
-      }
-    } else if (content.at_name_to_mid && typeof content.at_name_to_mid === 'object') {
-      atNames.push(...Object.keys(content.at_name_to_mid));
-    }
-
-    if (!rpid && !message && !uid) return null;
-
-    const existing = rpid ? metaByRpid.get(rpid) : null;
-    const merged = {
-      rpid: rpid || (existing && existing.rpid) || '',
-      uid: uid || (existing && existing.uid) || '',
-      uname: uname || (existing && existing.uname) || '',
-      sign: sign || (existing && existing.sign) || '',
-      message: message || (existing && existing.message) || '',
-      ctime: ctime || (existing && existing.ctime) || 0,
-      atNames: atNames.length > 0 ? atNames : (existing && existing.atNames) || [],
-    };
-
-    if (merged.rpid) {
-      lruSet(metaByRpid, merged.rpid, merged);
-    }
-    const snip = normalizeSnippet(merged.message);
-    if (snip) {
-      if (merged.uid) lruSet(metaByFingerprint, `u:${merged.uid}|${snip}`, merged);
-      if (merged.uname) lruSet(metaByFingerprint, `n:${merged.uname}|${snip}`, merged);
-    }
-
-    if (Array.isArray(raw.replies)) {
-      for (const sub of raw.replies) {
-        indexRawReplyObject(sub);
-      }
-    }
-
-    return merged;
-  }
-
-  function handleInterceptedApiJson(url, json) {
-    if (!json || typeof json !== 'object' || json.code !== 0 || !json.data) return;
-    const data = json.data;
-
-    if (url.includes('/x/web-interface/nav')) {
-      if (data.mid) pageContext.currentUserUid = String(data.mid);
-      return;
-    }
-
-    if (url.includes('/x/web-interface/view')) {
-      if (data.pubdate) pageContext.videoPubdate = Number(data.pubdate);
-      if (data.owner && data.owner.mid) pageContext.upperUid = String(data.owner.mid);
-      return;
-    }
-
-    if (url.includes('/x/v2/reply/')) {
-      if (data.upper && data.upper.mid) {
-        pageContext.upperUid = String(data.upper.mid);
-      }
-
-      const collections = [
-        data.replies,
-        data.top_replies,
-        data.hots,
-        data.dialog && data.dialog.replies,
-      ];
-      for (const list of collections) {
-        if (Array.isArray(list)) {
-          for (const item of list) {
-            indexRawReplyObject(item);
-          }
-        }
-      }
-      if (data.top && typeof data.top === 'object') {
-        if (data.top.upper) indexRawReplyObject(data.top.upper);
-        if (data.top.admin) indexRawReplyObject(data.top.admin);
-        if (data.top.vote) indexRawReplyObject(data.top.vote);
-      }
-      if (data.root && typeof data.root === 'object') {
-        indexRawReplyObject(data.root);
-      }
-
-      apiEpoch += 1;
-      scheduleReevaluateTracked(true);
-      setTimeout(() => scheduleReevaluateTracked(true), 140);
-    }
-  }
-
-  function shouldInspectUrl(url) {
-    if (!url || typeof url !== 'string') return false;
-    return (
-      url.includes('/x/v2/reply/') ||
-      url.includes('/x/web-interface/nav') ||
-      url.includes('/x/web-interface/view')
-    );
-  }
-
-  // Transparent Proxy on window.fetch (preserves fetch.name & Function.prototype.toString -> [native code])
-  if (typeof window.fetch === 'function' && typeof Proxy === 'function') {
-    try {
-      window.fetch = new Proxy(window.fetch, {
-        apply(target, thisArg, args) {
-          let url = '';
-          try {
-            const input = args[0];
-            url =
-              typeof input === 'string'
-                ? input
-                : (input && (input.url || input.href)) || '';
-          } catch (_e) {
-            url = '';
-          }
-          const resultPromise = Reflect.apply(target, thisArg, args);
-          if (shouldInspectUrl(url) && resultPromise && typeof resultPromise.then === 'function') {
-            resultPromise
-              .then((resp) => {
-                if (resp && resp.ok && typeof resp.clone === 'function') {
-                  try {
-                    const cloned = resp.clone();
-                    setTimeout(() => {
-                      cloned
-                        .json()
-                        .then((json) => handleInterceptedApiJson(url, json))
-                        .catch(() => {});
-                    }, 0);
-                  } catch (_e2) {
-                    // ignore
-                  }
-                }
-              })
-              .catch(() => {});
-          }
-          return resultPromise;
-        },
-      });
-    } catch (_err) {
-      // ignore
-    }
-  }
-
-  // Transparent Proxy on XMLHttpRequest.prototype.open & send
-  if (typeof XMLHttpRequest === 'function' && XMLHttpRequest.prototype && typeof Proxy === 'function') {
-    try {
-      const urlMap = new WeakMap();
-      XMLHttpRequest.prototype.open = new Proxy(XMLHttpRequest.prototype.open, {
-        apply(target, thisArg, args) {
-          try {
-            const rawUrl = args[1];
-            const urlStr = typeof rawUrl === 'string' ? rawUrl : String((rawUrl && rawUrl.href) || rawUrl || '');
-            if (shouldInspectUrl(urlStr)) {
-              urlMap.set(thisArg, urlStr);
-            }
-          } catch (_e) {
-            // ignore
-          }
-          return Reflect.apply(target, thisArg, args);
-        },
-      });
-
-      XMLHttpRequest.prototype.send = new Proxy(XMLHttpRequest.prototype.send, {
-        apply(target, thisArg, args) {
-          const targetUrl = urlMap.get(thisArg);
-          if (targetUrl && thisArg && typeof thisArg.addEventListener === 'function') {
-            thisArg.addEventListener(
-              'loadend',
-              function onXhrLoadEnd() {
-                setTimeout(() => {
-                  try {
-                    if (this.responseType === 'json' && this.response) {
-                      handleInterceptedApiJson(targetUrl, this.response);
-                    } else if (
-                      (!this.responseType || this.responseType === 'text') &&
-                      typeof this.responseText === 'string' &&
-                      this.responseText.startsWith('{')
-                    ) {
-                      handleInterceptedApiJson(targetUrl, JSON.parse(this.responseText));
-                    }
-                  } catch (_e) {
-                    // ignore
-                  }
-                }, 0);
-              },
-              { once: true }
-            );
-          }
-          return Reflect.apply(target, thisArg, args);
-        },
-      });
-    } catch (_err) {
-      // ignore
-    }
-  }
-
-  function extractLitCommentPayload(el) {
-    if (!el || typeof el !== 'object') return null;
-
-    const looksLikeReply = (obj) =>
-      Boolean(
-        obj &&
-          typeof obj === 'object' &&
-          (obj.rpid || obj.rpid_str || (obj.content && typeof obj.content.message === 'string'))
-      );
-
-    try {
-      if (el.__data && typeof el.__data === 'object') {
-        if (looksLikeReply(el.__data.data)) return el.__data.data;
-        if (looksLikeReply(el.__data.reply)) return el.__data.reply;
-        if (looksLikeReply(el.__data)) return el.__data;
-      }
-      if (looksLikeReply(el.data)) return el.data;
-      if (looksLikeReply(el._data)) return el._data;
-    } catch (_e) {
-      // ignore
-    }
-    return null;
-  }
-
-  function extractTextWithAlt(container) {
-    if (!container) return '';
-    let out = '';
-    const walk = (node) => {
-      if (!node) return;
-      if (node.nodeType === Node.TEXT_NODE) {
-        out += node.nodeValue || '';
-      } else if (node.nodeType === Node.ELEMENT_NODE) {
-        if (node.tagName === 'IMG') {
-          const alt = node.getAttribute('alt') || '';
-          if (alt) out += alt;
-        } else if (node.tagName === 'BR') {
-          out += '\n';
-        } else {
-          for (const ch of node.childNodes) walk(ch);
-        }
-      }
-    };
-    walk(container);
-    return out.trim();
-  }
-
-  /**
-   * Extracts uid, uname, and comment message from a renderer's Shadow DOM without querySelectorAll('*').
-   * Ensures @mentions inside <bili-rich-text> are NEVER mistaken for the comment author's uname/uid.
-   */
-  function extractShadowDomFallback(rendererEl) {
-    if (!rendererEl || !rendererEl.shadowRoot) return null;
-    let uid = '';
-    let uname = '';
-    let message = '';
-    let contentNode = null;
-
-    const extractAuthorFromRoot = (root) => {
-      if (!root || !root.querySelectorAll) return;
-      const anchors = root.querySelectorAll(
-        '#user-name a, #user-name, #user-avatar, [data-user-profile-id], a[href*="space.bilibili.com/"]'
-      );
-      for (const node of anchors) {
-        const attrUid = node.getAttribute && node.getAttribute('data-user-profile-id');
-        if (attrUid && /^\d+$/.test(attrUid) && !uid) {
-          uid = attrUid;
-        }
-        const href = (node.getAttribute && node.getAttribute('href')) || '';
-        const m = href.match(/space\.bilibili\.com\/(\d+)/);
-        if (m && m[1] && !uid) {
-          uid = m[1];
-        }
-        const txt = (node.textContent || '').replace(/^\s+|\s+$/g, '');
-        if (txt && !uname && txt.length <= 40 && !txt.startsWith('@')) {
-          uname = txt;
-        }
-      }
-    };
-
-    const inspectRendererRoot = (root) => {
-      if (!root || !root.querySelector) return;
-
-      // 1. Author identity strictly from <bili-comment-user-info> or direct header anchors
-      const userInfoEl = root.querySelector('bili-comment-user-info');
-      if (userInfoEl && userInfoEl.shadowRoot) {
-        extractAuthorFromRoot(userInfoEl.shadowRoot);
-      }
-      if (!uid || !uname) {
-        extractAuthorFromRoot(root);
-      }
-
-      // 2. Comment body from <bili-rich-text> or direct #contents
-      const richEl = root.querySelector('bili-rich-text');
-      if (richEl && richEl.shadowRoot) {
-        const contentsEl = richEl.shadowRoot.querySelector('#contents') || richEl.shadowRoot;
-        const richMsg = extractTextWithAlt(contentsEl);
-        if (richMsg) {
-          message = richMsg;
-          contentNode = contentsEl;
-        }
-      }
-      if (!message) {
-        const directContent = root.querySelector('#contents, #content-text, .reply-content');
-        if (directContent) {
-          const directMsg = extractTextWithAlt(directContent);
-          if (directMsg) {
-            message = directMsg;
-            contentNode = directContent;
-          }
-        }
-      }
-
-      // 3. If a nested <bili-comment-renderer> exists inside this root, inspect it directly
-      if (!message || (!uid && !uname)) {
-        const nestedRenderer = root.querySelector('bili-comment-renderer');
-        if (nestedRenderer && nestedRenderer.shadowRoot) {
-          inspectRendererRoot(nestedRenderer.shadowRoot);
-        }
-      }
-    };
-
-    inspectRendererRoot(rendererEl.shadowRoot);
-
-    if (!uid && !uname && !message) return null;
-    const res = { rpid: '', uid, uname, sign: '', message, ctime: 0, atNames: [] };
-    if (contentNode) {
-      Object.defineProperty(res, '__contentNode', { value: contentNode, enumerable: false });
-    }
-    return res;
-  }
-
   function resolveCommentMeta(rendererEl, threadEl) {
     const rawFromRenderer =
-      extractLitCommentPayload(rendererEl) ||
-      (threadEl ? extractLitCommentPayload(threadEl) : null);
+      domExtractor.extractLitCommentPayload(rendererEl) ||
+      (threadEl ? domExtractor.extractLitCommentPayload(threadEl) : null);
     if (rawFromRenderer) {
-      const indexed = indexRawReplyObject(rawFromRenderer);
+      const indexed = api.indexRawReplyObject(rawFromRenderer);
       if (indexed) return indexed;
     }
 
-    const domFallback = extractShadowDomFallback(rendererEl);
+    const domFallback = domExtractor.extractShadowDomFallback(rendererEl);
     if (!domFallback) return null;
 
-    const snip = normalizeSnippet(domFallback.message);
+    const snip = sniffer.normalizeSnippet(domFallback.message);
     if (snip) {
-      const byUid = domFallback.uid ? metaByFingerprint.get(`u:${domFallback.uid}|${snip}`) : null;
-      if (byUid) return byUid;
-      const byName = domFallback.uname ? metaByFingerprint.get(`n:${domFallback.uname}|${snip}`) : null;
-      if (byName) return byName;
+      const byUid = domFallback.uid ? api.metaByFingerprint.get(`u:${domFallback.uid}|${snip}`) : null;
+      if (byUid) {
+        if (domFallback.__contentNode) {
+          Object.defineProperty(byUid, '__contentNode', {
+            value: domFallback.__contentNode,
+            configurable: true,
+            enumerable: false,
+          });
+        }
+        return byUid;
+      }
+      const byName = domFallback.uname ? api.metaByFingerprint.get(`n:${domFallback.uname}|${snip}`) : null;
+      if (byName) {
+        if (domFallback.__contentNode) {
+          Object.defineProperty(byName, '__contentNode', {
+            value: domFallback.__contentNode,
+            configurable: true,
+            enumerable: false,
+          });
+        }
+        return byName;
+      }
     }
 
-    // Enrich with user-level profile cache (member.sign / uid / uname) captured from API
     const userProfile =
-      (domFallback.uid && userByUid.get(domFallback.uid)) ||
-      (domFallback.uname && userByUname.get(domFallback.uname)) ||
+      (domFallback.uid && api.userByUid.get(domFallback.uid)) ||
+      (domFallback.uname && api.userByUname.get(domFallback.uname)) ||
       null;
     if (userProfile) {
       if (!domFallback.uid && userProfile.uid) domFallback.uid = userProfile.uid;
       if (!domFallback.uname && userProfile.uname) domFallback.uname = userProfile.uname;
       if (!domFallback.sign && userProfile.sign) domFallback.sign = userProfile.sign;
+      if (!domFallback.level && userProfile.level) domFallback.level = userProfile.level;
     }
 
     return domFallback;
   }
 
-  const COLLAPSE_STYLE_CSS = `
-    :host([data-bak-state="hidden"]) {
-      display: none !important;
-    }
-    :host([data-bak-state="collapsed"]) > *:not([data-bak-banner]):not(style) {
-      display: none !important;
-    }
-    .bak-banner {
-      display: none;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin: 6px 0;
-      padding: 6px 12px;
-      border-radius: 6px;
-      background: rgba(0, 174, 236, 0.06);
-      border: 1px dashed rgba(0, 174, 236, 0.28);
-      color: #9499a0;
-      font-size: 12px;
-      line-height: 1.5;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    }
-    :host([data-bak-state="collapsed"]) > .bak-banner,
-    :host([data-bak-state="expanded"]) > .bak-banner {
-      display: flex !important;
-    }
-    .bak-banner-info {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .bak-badge {
-      flex-shrink: 0;
-      padding: 1px 6px;
-      border-radius: 4px;
-      background: rgba(251, 114, 153, 0.14);
-      color: #fb7299;
-      font-weight: 600;
-      font-size: 11px;
-    }
-    .bak-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-shrink: 0;
-    }
-    .bak-btn {
-      cursor: pointer;
-      border: none;
-      background: transparent;
-      color: #00aeec;
-      font-size: 12px;
-      padding: 0 4px;
-    }
-    .bak-btn:hover {
-      text-decoration: underline;
-    }
-    .bak-btn-whitelist {
-      color: #9499a0;
-    }
-    .bak-btn-whitelist:hover {
-      color: #fb7299;
-    }
-  `;
+  function isIdentityWhitelisted(uid, uname) {
+    const list = currentSettings.whitelistUids || [];
+    if (uid && list.includes(String(uid))) return true;
+    if (uname && list.includes(`@${uname}`)) return true;
+    return false;
+  }
 
   function ensureCollapseBanner(hostEl, meta, evalResult) {
     const sr = hostEl.shadowRoot;
-    if (!sr || sr.childNodes.length === 0) return;
+    if (!sr || !sr.childNodes || sr.childNodes.length === 0) return;
 
-    let styleEl = sr.querySelector('style[data-bak-style]');
-    if (!styleEl) {
-      styleEl = document.createElement('style');
-      styleEl.setAttribute('data-bak-style', '1');
-      styleEl.textContent = COLLAPSE_STYLE_CSS;
-      sr.appendChild(styleEl);
-    }
+    domExtractor.injectCollapseStyles(sr, document);
 
     let banner = sr.querySelector('div[data-bak-banner]');
     if (!banner) {
@@ -610,13 +202,17 @@
           pageContext.confirmedBotUids.delete(`n:${targetUname}`);
         }
         if (targetUid) {
-          if (!currentSettings.whitelistUids.includes(targetUid)) {
-            currentSettings.whitelistUids.push(targetUid);
-          }
           pageContext.confirmedBotUids.delete(String(targetUid));
+        }
+
+        const identityToken = targetUid ? String(targetUid) : targetUname ? `@${targetUname}` : '';
+        if (identityToken) {
+          if (!currentSettings.whitelistUids.includes(identityToken)) {
+            currentSettings.whitelistUids.push(identityToken);
+          }
           settingsEpoch += 1;
           sendToBridge('ADD_WHITELIST_UID', {
-            uid: targetUid,
+            uid: targetUid || identityToken,
             uname: targetUname || '',
           });
           scheduleReevaluateTracked(true);
@@ -642,7 +238,7 @@
       reasonEl.textContent = `已折叠疑似 AI 评论：${authorTag}${reasonSummary}`;
     }
     if (whiteBtn) {
-      whiteBtn.style.display = meta && meta.uid ? '' : 'none';
+      whiteBtn.style.display = meta && (meta.uid || meta.uname) ? '' : 'none';
     }
     if (toggleBtn && hostEl.getAttribute('data-bak-state') !== 'expanded') {
       toggleBtn.textContent = '展开查看';
@@ -684,7 +280,9 @@
       }
     }
 
-    const logKey = (meta && meta.rpid) || `${(meta && meta.uid) || (meta && meta.uname) || ''}:${normalizeSnippet(meta && meta.message)}`;
+    const logKey =
+      (meta && meta.rpid) ||
+      `${(meta && meta.uid) || (meta && meta.uname) || ''}:${sniffer.normalizeSnippet(meta && meta.message)}`;
     if (logKey && !blockedLogRpidSet.has(logKey)) {
       blockedLogRpidSet.add(logKey);
       sendToBridge('COMMENT_BLOCKED', {
@@ -708,12 +306,12 @@
       return;
     }
 
-    // Fast O(1) dirty-check: skip DOM traversal if comment is already extracted and unchanged
-    let needResolve = !entry.meta || !entry.meta.message || entry.lastApiEpoch !== apiEpoch;
+    const currentApiEpoch = api.getApiEpoch();
+    let needResolve = !entry.meta || !entry.meta.message || entry.lastApiEpoch !== currentApiEpoch;
     if (!needResolve) {
       const rawPayload =
-        extractLitCommentPayload(entry.rendererEl) ||
-        (entry.isThread ? extractLitCommentPayload(hostEl) : null);
+        domExtractor.extractLitCommentPayload(entry.rendererEl) ||
+        (entry.isThread ? domExtractor.extractLitCommentPayload(hostEl) : null);
       if (rawPayload) {
         const rawRpid = String(rawPayload.rpid_str || rawPayload.rpid || '').trim();
         if (rawRpid && entry.meta.rpid && rawRpid !== entry.meta.rpid) {
@@ -742,10 +340,10 @@
         }
         entry.meta = freshMeta;
         entry.identityKey = newIdKey;
-        entry.lastApiEpoch = apiEpoch;
-      } else if (entry.meta && entry.meta.rpid && !entry.meta.sign && metaByRpid.has(entry.meta.rpid)) {
-        entry.meta = metaByRpid.get(entry.meta.rpid);
-        entry.lastApiEpoch = apiEpoch;
+        entry.lastApiEpoch = currentApiEpoch;
+      } else if (entry.meta && entry.meta.rpid && !entry.meta.sign && api.metaByRpid.has(entry.meta.rpid)) {
+        entry.meta = api.metaByRpid.get(entry.meta.rpid);
+        entry.lastApiEpoch = currentApiEpoch;
       }
     }
 
@@ -764,22 +362,33 @@
     }
 
     let parentThreadIsAi = false;
+    let domParentMessage = '';
     if (!entry.isThread && entry.parentThreadEl) {
       const parentEntry = trackedHosts.get(entry.parentThreadEl);
-      if (parentEntry && parentEntry.lastResult && parentEntry.lastResult.action === 'block') {
-        parentThreadIsAi = true;
+      if (parentEntry) {
+        if (parentEntry.lastResult && parentEntry.lastResult.action === 'block') {
+          parentThreadIsAi = true;
+        }
+        if (parentEntry.meta && parentEntry.meta.message) {
+          domParentMessage = parentEntry.meta.message;
+        }
       }
     }
 
+    const apiParentCtx = api.getParentContext(meta);
+    const parentMessage = apiParentCtx.parentMessage || domParentMessage;
+    const threadBotCadence = apiParentCtx.threadBotCadence;
+
     const llmVerdict = meta.rpid ? llmVerdictByRpid.get(meta.rpid) : null;
-    const isWhitelisted = Boolean(meta.uid && currentSettings.whitelistUids.includes(String(meta.uid)));
+    const whitelisted = isIdentityWhitelisted(meta.uid, meta.uname);
     const isConfirmedBot =
-      !isWhitelisted &&
+      !whitelisted &&
       Boolean(
         (meta.uid && pageContext.confirmedBotUids.has(String(meta.uid))) ||
           (meta.uname && pageContext.confirmedBotUids.has(`n:${meta.uname}`))
       );
-    const evalKey = `${meta.rpid}|${meta.uid}|${meta.uname}|${(meta.sign || '').length}|${(meta.message || '').length}|${isConfirmedBot ? 1 : 0}|${parentThreadIsAi ? 1 : 0}|${llmVerdict ? Number(llmVerdict.isAi) : -1}|${settingsEpoch}`;
+
+    const evalKey = `${meta.rpid}|${meta.uid}|${meta.uname}|${(meta.sign || '').length}|${(meta.message || '').length}|${isConfirmedBot ? 1 : 0}|${parentThreadIsAi ? 1 : 0}|${threadBotCadence ? 1 : 0}|${llmVerdict ? Number(llmVerdict.isAi) : -1}|${settingsEpoch}`;
 
     if (entry.lastEvalKey === evalKey && entry.lastResult) {
       if (entry.lastResult.action === 'block') {
@@ -794,10 +403,14 @@
       refreshInitialStateContext();
     }
 
-    // If this username was already confirmed as a bot even without UID, mark uid in context
     const effectiveContext = {
-      ...pageContext,
+      currentUserUid: pageContext.currentUserUid,
+      upperUid: pageContext.upperUid,
+      videoPubdate: pageContext.videoPubdate,
+      confirmedBotUids: pageContext.confirmedBotUids,
       parentThreadIsAi,
+      parentMessage,
+      threadBotCadence,
     };
 
     const res = isConfirmedBot
@@ -807,7 +420,7 @@
           threshold: 55,
           primaryCategory: 'persona_dafeiyu',
           categoryLabel: '同号AI实锤',
-          reasons: ['该账号在本页已实锤为AI号'],
+          reasons: ['该账号已被实锤为AI挂机号'],
           confirmUidAsBot: true,
         }
       : detector.evaluateComment(meta, currentSettings, effectiveContext);
@@ -824,6 +437,11 @@
       if (meta.uname && !pageContext.confirmedBotUids.has(`n:${meta.uname}`)) {
         pageContext.confirmedBotUids.add(`n:${meta.uname}`);
         addedNew = true;
+      }
+      // Persist hard-confirmed bot identities across tabs (session-scoped)
+      if (res.score >= 78 && meta.uid && !syncedBotIdentities.has(meta.uid)) {
+        syncedBotIdentities.add(meta.uid);
+        sendToBridge('RECORD_CONFIRMED_BOT', { uid: meta.uid, uname: meta.uname || '' });
       }
       if (addedNew) {
         scheduleReevaluateTracked(false);
@@ -871,8 +489,35 @@
     restoreHost(hostEl);
   }
 
+  // Time-sliced frame-budget scheduler: fast synchronous first batch, yields if > 4.5ms
+  const FRAME_BUDGET_MS = 4.5;
   let reevalScheduled = false;
   let pendingFullRescan = false;
+  let sliceTimer = null;
+
+  function nowMs() {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+  }
+
+  function runSlicedEntries(entriesList, startIndex) {
+    sliceTimer = null;
+    const start = nowMs();
+    for (let i = startIndex; i < entriesList.length; i++) {
+      const [hostEl, entry] = entriesList[i];
+      evaluateAndActOnEntry(hostEl, entry);
+      if (i - startIndex >= 24 && nowMs() - start > FRAME_BUDGET_MS && i + 1 < entriesList.length) {
+        const scheduleNext =
+          typeof requestAnimationFrame === 'function'
+            ? requestAnimationFrame
+            : (fn) => setTimeout(fn, 16);
+        sliceTimer = scheduleNext(() => runSlicedEntries(entriesList, i + 1));
+        return;
+      }
+    }
+  }
+
   function scheduleReevaluateTracked(forceFullRescan = false) {
     if (forceFullRescan) pendingFullRescan = true;
     if (reevalScheduled) return;
@@ -884,9 +529,8 @@
       if (doFull) {
         scanBiliCommentsTree();
       } else {
-        for (const [hostEl, entry] of trackedHosts.entries()) {
-          evaluateAndActOnEntry(hostEl, entry);
-        }
+        const snapshot = Array.from(trackedHosts.entries());
+        runSlicedEntries(snapshot, 0);
       }
     });
   }
@@ -977,7 +621,7 @@
   function inspectNodeTree(rootNode) {
     if (!rootNode) return;
     let isBiliCustomTag = false;
-    if (rootNode.nodeType === Node.ELEMENT_NODE) {
+    if (rootNode.nodeType === 1) {
       const tag = rootNode.tagName || '';
       isBiliCustomTag = tag.startsWith('BILI-');
       if (tag === 'BILI-COMMENTS') {
@@ -1016,10 +660,9 @@
       }
     }
 
-    // Skip expensive querySelectorAll on leaf elements (e.g. <span>, <a>, <img>, <p>)
     if (
       !isBiliCustomTag &&
-      rootNode.nodeType === Node.ELEMENT_NODE &&
+      rootNode.nodeType === 1 &&
       rootNode.childNodes &&
       rootNode.childNodes.length === 0
     ) {
@@ -1044,10 +687,6 @@
     }
   }
 
-  /**
-   * Attaches MutationObserver ONLY to container shadowRoots (bili-comments, thread, replies),
-   * avoiding hundreds of inner characterData observers on leaf nodes.
-   */
   function ensureObserved(shadowRoot) {
     if (!shadowRoot || observedRoots.has(shadowRoot)) return;
     observedRoots.add(shadowRoot);
@@ -1055,7 +694,7 @@
     const obs = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const added of m.addedNodes) {
-          if (added.nodeType === Node.ELEMENT_NODE) {
+          if (added.nodeType === 1) {
             if (
               added.hasAttribute &&
               (added.hasAttribute('data-bak-banner') || added.hasAttribute('data-bak-style'))
@@ -1070,10 +709,6 @@
     obs.observe(shadowRoot, { childList: true, subtree: true });
   }
 
-  /**
-   * Explicitly walks all <bili-comments> -> <bili-comment-thread-renderer> -> <bili-comment-reply-renderer>
-   * even if their outer shadowRoot was already added to observedRoots when initially empty.
-   */
   function scanBiliCommentsTree() {
     if (!document || !document.querySelectorAll) return false;
     const allCommentRoots = document.querySelectorAll('bili-comments');
@@ -1107,7 +742,7 @@
     activeDocObs = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const added of m.addedNodes) {
-          if (added.nodeType === Node.ELEMENT_NODE && added.tagName === 'BILI-COMMENTS') {
+          if (added.nodeType === 1 && added.tagName === 'BILI-COMMENTS') {
             inspectNodeTree(added);
             if (added.shadowRoot && activeDocObs) {
               activeDocObs.disconnect();
@@ -1174,17 +809,40 @@
 
       if (msg.type === 'SYNC_SETTINGS') {
         currentSettings = detector.normalizeSettings(msg.payload);
-        settingsEpoch += 1;
-        for (const wUid of currentSettings.whitelistUids) {
-          pageContext.confirmedBotUids.delete(wUid);
+        if (Array.isArray(msg.confirmedBots)) {
+          for (const bUid of msg.confirmedBots) {
+            if (bUid) pageContext.confirmedBotUids.add(String(bUid));
+          }
         }
+        for (const token of currentSettings.whitelistUids) {
+          if (token.startsWith('@')) {
+            pageContext.confirmedBotUids.delete(`n:${token.slice(1)}`);
+          } else {
+            pageContext.confirmedBotUids.delete(token);
+          }
+        }
+        settingsEpoch += 1;
         scheduleReevaluateTracked(true);
+      } else if (msg.type === 'SYNC_CONFIRMED_BOTS') {
+        const list = Array.isArray(msg.payload) ? msg.payload : [];
+        let changed = false;
+        for (const bUid of list) {
+          const s = String(bUid || '').trim();
+          if (s && !pageContext.confirmedBotUids.has(s) && !isIdentityWhitelisted(s, '')) {
+            pageContext.confirmedBotUids.add(s);
+            changed = true;
+          }
+        }
+        if (changed) {
+          settingsEpoch += 1;
+          scheduleReevaluateTracked(false);
+        }
       } else if (msg.type === 'LLM_VERDICTS') {
         const verdicts = Array.isArray(msg.payload) ? msg.payload : [];
         for (const v of verdicts) {
           if (v && v.rpid) {
             pendingLlmRpids.delete(String(v.rpid));
-            lruSet(llmVerdictByRpid, String(v.rpid), v, 2000);
+            sniffer.lruSet(llmVerdictByRpid, String(v.rpid), v, 2000);
           }
         }
         settingsEpoch += 1;

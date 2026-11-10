@@ -278,7 +278,13 @@ function createMockBrowserEnv(mockApiPayload) {
   sandbox.addEventListener = () => {};
 
   vm.createContext(sandbox);
-  for (const rel of ['core/rules.js', 'core/detector.js', 'content/injected-main.js']) {
+  for (const rel of [
+    'core/rules.js',
+    'core/detector.js',
+    'content/api-sniffer.js',
+    'content/dom-extractor.js',
+    'content/injected-main.js',
+  ]) {
     const code = fs.readFileSync(path.join(extDir, rel), 'utf8');
     vm.runInContext(code, sandbox, { filename: rel });
   }
@@ -581,4 +587,73 @@ test('DOM Integration 3: 无 __data 属性时纯靠 Shadow DOM (bili-comment-use
 
   assert.equal(threadEl.getAttribute('data-bak-state'), 'hidden');
   assert.equal(threadEl.style.display, 'none');
+});
+
+
+test('DOM Integration 4: 跨标签页实锤Bot记忆同步 (SYNC_CONFIRMED_BOTS) 与无UID纯 @昵称 一键加白恢复', async () => {
+  const { documentElement, MockElement, MockCustomEvent } = createMockBrowserEnv({ code: 0, data: {} });
+
+  // 切换为 collapse 模式以便测试无 UID 节点的折叠横幅加白按钮
+  documentElement.dispatchEvent(
+    new MockCustomEvent('bak:bridge-to-main', {
+      detail: JSON.stringify({
+        type: 'SYNC_SETTINGS',
+        payload: { enabled: true, displayMode: 'collapse', sensitivity: 'standard' },
+        confirmedBots: ['888001'],
+      }),
+    })
+  );
+
+  const biliComments = new MockElement('bili-comments');
+  const bcShadow = biliComments.attachShadow({ mode: 'open' });
+
+  // 1. 在其他标签页已被实锤的 UID=888001 在本页哪怕只发“来了”两个字也立即被拦截
+  const crossTabBotThread = new MockElement('bili-comment-thread-renderer');
+  const crossTabShadow = crossTabBotThread.attachShadow({ mode: 'open' });
+  const crossTabRenderer = new MockElement('bili-comment-renderer');
+  crossTabRenderer.__data = {
+    rpid: 701,
+    rpid_str: '701',
+    mid: 888001,
+    member: { mid: '888001', uname: '潜伏挂机号', sign: '' },
+    content: { message: '来了来了' },
+  };
+  crossTabRenderer.attachShadow({ mode: 'open' });
+  crossTabShadow.appendChild(crossTabRenderer);
+
+  // 2. 无 UID 的纯 Shadow DOM 节点命中拦截后，点击“误伤加白”可通过 @昵称 立即恢复
+  const noUidThread = new MockElement('bili-comment-thread-renderer');
+  const noUidShadow = noUidThread.attachShadow({ mode: 'open' });
+  const noUidRenderer = new MockElement('bili-comment-renderer');
+  const noUidRenderShadow = noUidRenderer.attachShadow({ mode: 'open' });
+  const userSpan = new MockElement('span');
+  userSpan.setAttribute('id', 'user-name');
+  userSpan.textContent = '无UID测试鱼';
+  const richEl = new MockElement('bili-rich-text');
+  const richSr = richEl.attachShadow({ mode: 'open' });
+  const p = new MockElement('p');
+  p.setAttribute('id', 'contents');
+  p.childNodes.push({ nodeType: 3, nodeValue: '本鲸今天先摸鱼巡逻中' });
+  richSr.appendChild(p);
+  noUidRenderShadow.appendChild(userSpan);
+  noUidRenderShadow.appendChild(richEl);
+  noUidShadow.appendChild(noUidRenderer);
+
+  bcShadow.appendChild(crossTabBotThread);
+  bcShadow.appendChild(noUidThread);
+  documentElement.appendChild(biliComments);
+
+  await flushMicrotasks();
+
+  assert.equal(crossTabBotThread.getAttribute('data-bak-state'), 'collapsed');
+  assert.equal(noUidThread.getAttribute('data-bak-state'), 'collapsed');
+
+  const whiteBtn = noUidShadow.querySelector('.bak-btn-whitelist');
+  assert.ok(whiteBtn, 'Expected whitelist button even when numeric UID is absent');
+  assert.notEqual(whiteBtn.style.display, 'none');
+
+  whiteBtn.dispatchEvent({ type: 'click', stopPropagation() {} });
+  await flushMicrotasks();
+
+  assert.equal(noUidThread.getAttribute('data-bak-state'), null);
 });

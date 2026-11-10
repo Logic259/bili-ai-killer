@@ -1,7 +1,7 @@
 /**
- * Bili-AI-Killer — ISOLATED World Bridge
- * Connects MAIN world (injected-main.js) with chrome.storage.local & MV3 Service Worker.
- * Keeps API keys and extension storage strictly isolated from page scripts.
+ * Bili-AI-Killer — ISOLATED World Bridge (v3.0)
+ * Connects MAIN world (injected-main.js) with chrome.storage & MV3 Service Worker.
+ * Keeps API keys strictly isolated from page scripts and batches IPC writes.
  */
 (function initContentBridge() {
   'use strict';
@@ -9,8 +9,10 @@
   const EVT_TO_MAIN = 'bak:bridge-to-main';
   const EVT_TO_ISOLATED = 'bak:main-to-bridge';
   const STORAGE_KEY_SETTINGS = 'bak_settings';
+  const SESSION_KEY_BOTS = 'bak_session_bots';
 
   let cachedSettings = null;
+  let cachedConfirmedBots = [];
   let llmQueue = [];
   let llmTimer = null;
   let blockedQueue = [];
@@ -27,7 +29,6 @@
   function stripSensitiveForMain(settings) {
     if (!settings || typeof settings !== 'object') return {};
     const copy = JSON.parse(JSON.stringify(settings));
-    // Never expose raw API key string to MAIN world; only pass boolean readiness flag
     if (copy.llm && typeof copy.llm === 'object') {
       const hasKey = Boolean(copy.llm.apiKey && String(copy.llm.apiKey).trim());
       copy.llm.apiKey = hasKey ? '__CONFIGURED__' : '';
@@ -35,9 +36,9 @@
     return copy;
   }
 
-  function sendToMain(type, payload) {
+  function sendToMain(type, payload, extra = {}) {
     try {
-      const detail = JSON.stringify({ type, payload });
+      const detail = JSON.stringify({ type, payload, ...extra });
       document.documentElement.dispatchEvent(new CustomEvent(EVT_TO_MAIN, { detail }));
     } catch (_err) {
       // ignore
@@ -60,24 +61,15 @@
 
   function syncSettingsFromStorage() {
     if (!isContextValid()) return;
-    try {
-      chrome.storage.local.get([STORAGE_KEY_SETTINGS], (res) => {
-        if (chrome.runtime.lastError) return;
-        cachedSettings = (res && res[STORAGE_KEY_SETTINGS]) || null;
-        if (cachedSettings) {
-          sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings));
-        } else {
-          safeSendRuntimeMessage({ type: 'GET_SETTINGS' }, (resp) => {
-            if (resp && resp.settings) {
-              cachedSettings = resp.settings;
-              sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings));
-            }
-          });
-        }
-      });
-    } catch (_err) {
-      // ignore
-    }
+    safeSendRuntimeMessage({ type: 'GET_SETTINGS' }, (resp) => {
+      if (resp && resp.settings) {
+        cachedSettings = resp.settings;
+        cachedConfirmedBots = Array.isArray(resp.confirmedBots) ? resp.confirmedBots : [];
+        sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings), {
+          confirmedBots: cachedConfirmedBots,
+        });
+      }
+    });
   }
 
   function flushLlmBatch() {
@@ -121,7 +113,6 @@
     }
   }
 
-  // Listen to events emitted by MAIN world
   document.documentElement.addEventListener(EVT_TO_ISOLATED, (ev) => {
     if (!ev || typeof ev.detail !== 'string') return;
     try {
@@ -132,7 +123,9 @@
         case 'MAIN_READY':
           safeSendRuntimeMessage({ type: 'TAB_RESET', url: (msg.payload && msg.payload.url) || location.href });
           if (cachedSettings) {
-            sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings));
+            sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings), {
+              confirmedBots: cachedConfirmedBots,
+            });
           } else {
             syncSettingsFromStorage();
           }
@@ -150,6 +143,14 @@
 
         case 'COMMENT_BLOCKED':
           enqueueBlockedEntry(msg.payload);
+          break;
+
+        case 'RECORD_CONFIRMED_BOT':
+          safeSendRuntimeMessage({
+            type: 'RECORD_CONFIRMED_BOT',
+            uid: msg.payload && msg.payload.uid,
+            uname: msg.payload && msg.payload.uname,
+          });
           break;
 
         case 'ADD_WHITELIST_UID':
@@ -172,13 +173,20 @@
     }
   });
 
-  // Automatically propagate settings updates from Popup / Storage to MAIN world without reload
   if (isContextValid() && chrome.storage && chrome.storage.onChanged) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName === 'local' && changes[STORAGE_KEY_SETTINGS]) {
         cachedSettings = changes[STORAGE_KEY_SETTINGS].newValue;
         if (cachedSettings) {
-          sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings));
+          sendToMain('SYNC_SETTINGS', stripSensitiveForMain(cachedSettings), {
+            confirmedBots: cachedConfirmedBots,
+          });
+        }
+      } else if (areaName === 'session' && changes[SESSION_KEY_BOTS]) {
+        const nextBots = changes[SESSION_KEY_BOTS].newValue;
+        if (Array.isArray(nextBots)) {
+          cachedConfirmedBots = nextBots;
+          sendToMain('SYNC_CONFIRMED_BOTS', cachedConfirmedBots);
         }
       }
     });

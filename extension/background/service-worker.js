@@ -1,21 +1,30 @@
 /**
- * Bili-AI-Killer — Manifest V3 Background Service Worker
- * Handles persistent settings, per-tab blocked logs (via chrome.storage.session),
- * toolbar badge counters, UID whitelist/blacklist updates, and batched LLM API calls.
+ * Bili-AI-Killer — Manifest V3 Background Service Worker (v3.0)
+ * Handles persistent settings, cross-tab confirmed bot memory, per-tab blocked logs,
+ * toolbar badge counters, UID/@uname whitelisting, live sample testing, and batched LLM calls.
  */
 import '../core/rules.js';
 import '../core/detector.js';
 import { judgeCommentsBatch, testLlmConnection, PROVIDER_PRESETS } from './llm-judge.js';
 
-const { DEFAULT_SETTINGS, BUILTIN_PRESET_KEYWORDS, normalizeSettings } = globalThis.__BAK_CORE__.detector;
+const {
+  DEFAULT_SETTINGS,
+  BUILTIN_PRESET_KEYWORDS,
+  CATEGORY_META,
+  normalizeSettings,
+  evaluateComment,
+} = globalThis.__BAK_CORE__.detector;
 
 const STORAGE_KEY_SETTINGS = 'bak_settings';
 const STORAGE_KEY_STATS = 'bak_stats';
 const STORAGE_KEY_LLM_CACHE = 'bak_llm_cache';
-const MAX_TAB_LOGS = 50;
+const SESSION_KEY_BOTS = 'bak_session_bots';
+const MAX_TAB_LOGS = 60;
 const MAX_LLM_CACHE = 1200;
+const MAX_SESSION_BOTS = 1200;
 
 const memTabState = new Map();
+let memSessionBots = null;
 let llmCacheMap = null;
 
 async function getSettings() {
@@ -32,6 +41,44 @@ async function saveSettings(partial) {
   const normalized = normalizeSettings(partial);
   await chrome.storage.local.set({ [STORAGE_KEY_SETTINGS]: normalized });
   return normalized;
+}
+
+async function getConfirmedBots() {
+  if (Array.isArray(memSessionBots)) return memSessionBots;
+  if (chrome.storage.session) {
+    const res = await chrome.storage.session.get([SESSION_KEY_BOTS]);
+    memSessionBots = Array.isArray(res && res[SESSION_KEY_BOTS]) ? res[SESSION_KEY_BOTS] : [];
+  } else {
+    memSessionBots = [];
+  }
+  return memSessionBots;
+}
+
+async function addConfirmedBot(uid) {
+  const cleanUid = String(uid || '').trim();
+  if (!/^\d+$/.test(cleanUid)) return;
+  const list = await getConfirmedBots();
+  if (list.includes(cleanUid)) return;
+  list.push(cleanUid);
+  while (list.length > MAX_SESSION_BOTS) {
+    list.shift();
+  }
+  if (chrome.storage.session) {
+    await chrome.storage.session.set({ [SESSION_KEY_BOTS]: list });
+  }
+}
+
+async function removeConfirmedBot(uid) {
+  const cleanUid = String(uid || '').trim();
+  if (!cleanUid) return;
+  const list = await getConfirmedBots();
+  const next = list.filter((x) => x !== cleanUid);
+  if (next.length !== list.length) {
+    memSessionBots = next;
+    if (chrome.storage.session) {
+      await chrome.storage.session.set({ [SESSION_KEY_BOTS]: next });
+    }
+  }
 }
 
 async function getStats() {
@@ -123,9 +170,7 @@ async function persistLlmCache() {
   await chrome.storage.local.set({ [STORAGE_KEY_LLM_CACHE]: serialized });
 }
 
-// Serialize per-tab state mutations to avoid race conditions during burst scrolling
 let recordChain = Promise.resolve();
-
 function enqueueRecordTask(fn) {
   recordChain = recordChain.then(fn, fn);
   return recordChain;
@@ -147,8 +192,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
       case 'GET_SETTINGS': {
-        const settings = await getSettings();
-        sendResponse({ ok: true, settings, presets: PROVIDER_PRESETS });
+        const [settings, confirmedBots] = await Promise.all([getSettings(), getConfirmedBots()]);
+        sendResponse({ ok: true, settings, confirmedBots, presets: PROVIDER_PRESETS });
         break;
       }
 
@@ -166,6 +211,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const settings = await getSettings();
         await setTabState(senderTabId, { count: 0, url: msg.url || '', logs: [] });
         await updateBadge(senderTabId, 0, settings.enabled);
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'RECORD_CONFIRMED_BOT': {
+        if (msg.uid) {
+          await addConfirmedBot(msg.uid);
+        }
         sendResponse({ ok: true });
         break;
       }
@@ -220,28 +273,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           tabState,
           presets: PROVIDER_PRESETS,
           builtinPresets: BUILTIN_PRESET_KEYWORDS,
+          categoryMeta: CATEGORY_META,
         });
         break;
       }
 
+      case 'EVALUATE_SAMPLE': {
+        const settings = await getSettings();
+        const sample = msg.sample && typeof msg.sample === 'object' ? msg.sample : {};
+        const verdict = evaluateComment(sample, settings, {});
+        sendResponse({ ok: true, verdict });
+        break;
+      }
+
       case 'ADD_WHITELIST_UID': {
-        const uid = String(msg.uid || '').trim();
-        if (!/^\d+$/.test(uid)) {
-          sendResponse({ ok: false, error: '无效的 UID' });
+        const rawUid = String(msg.uid || '').trim();
+        const rawUname = String(msg.uname || '').trim();
+        let token = '';
+        if (/^\d+$/.test(rawUid)) {
+          token = rawUid;
+          await removeConfirmedBot(rawUid);
+        } else if (rawUid.startsWith('@') && rawUid.length > 1) {
+          token = rawUid;
+        } else if (rawUname) {
+          token = `@${rawUname}`;
+        }
+
+        if (!token) {
+          sendResponse({ ok: false, error: '无效的 UID 或昵称' });
           break;
         }
+
         const settings = await getSettings();
-        if (!settings.whitelistUids.includes(uid)) {
-          settings.whitelistUids.push(uid);
+        if (!settings.whitelistUids.includes(token)) {
+          settings.whitelistUids.push(token);
         }
-        settings.blacklistUids = settings.blacklistUids.filter((x) => x !== uid);
+        settings.blacklistUids = settings.blacklistUids.filter((x) => x !== token);
         const saved = await saveSettings(settings);
 
-        // Clean matching entries from active tab logs and update badge
         if (senderTabId > 0) {
           const tabState = await getTabState(senderTabId);
           const beforeLen = (tabState.logs || []).length;
-          tabState.logs = (tabState.logs || []).filter((item) => String(item.uid) !== uid);
+          tabState.logs = (tabState.logs || []).filter((item) => {
+            if (/^\d+$/.test(token)) return String(item.uid) !== token;
+            return `@${item.uname || ''}` !== token;
+          });
           const removed = Math.max(0, beforeLen - tabState.logs.length);
           tabState.count = Math.max(0, (tabState.count || 0) - removed);
           await setTabState(senderTabId, tabState);
@@ -300,10 +376,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       case 'CLEAR_STATS': {
-        await chrome.storage.local.set({
-          [STORAGE_KEY_STATS]: { totalBlocked: 0, byCategory: {} },
-          [STORAGE_KEY_LLM_CACHE]: [],
-        });
+        memSessionBots = [];
+        const clearPromises = [
+          chrome.storage.local.set({
+            [STORAGE_KEY_STATS]: { totalBlocked: 0, byCategory: {} },
+            [STORAGE_KEY_LLM_CACHE]: [],
+          }),
+        ];
+        if (chrome.storage.session) {
+          clearPromises.push(chrome.storage.session.set({ [SESSION_KEY_BOTS]: [] }));
+        }
+        await Promise.all(clearPromises);
         if (llmCacheMap) llmCacheMap.clear();
         sendResponse({ ok: true });
         break;
@@ -316,5 +399,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: false, error: (err && err.message) || String(err) });
   });
 
-  return true; // Keep message channel open for async response
+  return true;
 });

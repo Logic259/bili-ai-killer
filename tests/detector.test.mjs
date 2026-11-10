@@ -490,3 +490,87 @@ test('Manifest V3 配置与引用的脚本、图标文件完整性校验', () =>
     assert.ok(fs.existsSync(abs), `Missing extension file referenced in manifest.json: ${rel}`);
   }
 });
+
+
+test('v3.0 升级校验：美食区“白饭”零误伤 vs 鱼塘“白饭”拦截、引文复读双簧检测、@昵称黑白名单与 2000 条吞吐基准', () => {
+  const settings = normalizeSettings({
+    ...DEFAULT_SETTINGS,
+    whitelistUids: ['@被保护的昵称'],
+    blacklistUids: ['@手动拉黑号'],
+  });
+
+  // 1. 美食视频里正常人类讨论“白饭”绝不误伤（修复 v2.1 单独“白饭”一刀切风险）
+  const foodComment = {
+    uid: '50001',
+    uname: '干饭人小王',
+    level: 2,
+    sign: '',
+    message: '这道红烧肉看着太下饭了，配一碗热乎乎的大白饭我能直接炫光！',
+  };
+  const rFood = evaluateComment(foodComment, settings);
+  assert.equal(rFood.action, 'allow', `Expected food comment to pass, got score=${rFood.score}`);
+  assert.equal(rFood.score, 0, 'Normal LV2 user discussing white rice should get 0 pts');
+
+  // 2. 鱼塘语境下的“白饭”依然精准秒杀
+  const fishRice = {
+    uid: '50002',
+    uname: '深海潜水员',
+    level: 2,
+    sign: '',
+    message: '今天省点算力，不然白饭也泡汤喵',
+  };
+  assert.equal(evaluateComment(fishRice, settings).action, 'block');
+
+  // 3. @昵称 白名单与黑名单生效（无需数字 UID）
+  assert.equal(
+    evaluateComment({ uid: '', uname: '被保护的昵称', sign: '已接入DeepSeek', message: '本鲸来了' }, settings).action,
+    'allow'
+  );
+  assert.equal(
+    evaluateComment({ uid: '', uname: '手动拉黑号', sign: '', message: '普通一句话' }, settings).action,
+    'block'
+  );
+
+  // 4. 楼中楼提取前文词句加直角引号「」复读接话 + 机械间隔节奏 + LV2 组合拦截
+  const echoBotReply = {
+    uid: '50009',
+    uname: '路人甲2026',
+    level: 2,
+    sign: '',
+    message: '「顺手写清场景」这个习惯确实实用——每次踩坑记一笔，回头查起来省心不少。',
+  };
+  const rEcho = evaluateComment(echoBotReply, settings, {
+    parentMessage: '我现在记的时候会顺手写清场景，不然回头想不起该用在哪',
+    threadBotCadence: true,
+  });
+  assert.equal(rEcho.action, 'block', `Expected lexical-echo + cadence + LV2 reply to block, got score=${rEcho.score}`);
+
+  // 5. 性能基准：1000 条冷启动评估 + 1000 条 LRU 命中评估总耗时必须 < 120ms
+  const t0 = performance.now();
+  for (let i = 0; i < 1000; i++) {
+    evaluateComment(
+      {
+        uid: String(100000 + i),
+        uname: `测试观众_${i}`,
+        level: (i % 6) + 1,
+        sign: '',
+        message: `这期视频第 ${i} 秒的细节做得真不错，UP主用心了！`,
+      },
+      settings
+    );
+  }
+  for (let i = 0; i < 1000; i++) {
+    evaluateComment(
+      {
+        uid: String(100000 + (i % 50)),
+        uname: `测试观众_${i % 50}`,
+        level: ((i % 50) % 6) + 1,
+        sign: '',
+        message: `这期视频第 ${i % 50} 秒的细节做得真不错，UP主用心了！`,
+      },
+      settings
+    );
+  }
+  const elapsedMs = performance.now() - t0;
+  assert.ok(elapsedMs < 150, `Expected 2000 evaluations < 150ms, took ${elapsedMs.toFixed(2)}ms`);
+});

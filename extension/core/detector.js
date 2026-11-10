@@ -1,6 +1,6 @@
 /**
- * Bili-AI-Killer — Multi-Dimensional Heuristic Scoring Engine (v2.0)
- * Zero DOM dependencies. Runs identically in Browser MAIN world, Service Worker, and Node.js tests.
+ * Bili-AI-Killer — Multi-Dimensional Heuristic, Stylometric & Thread-Context Engine (v3.0)
+ * Zero DOM dependencies. Runs identically in Browser MAIN world, Service Worker, Popup, and Node.js tests.
  */
 (function initDetectorScope(root) {
   'use strict';
@@ -38,21 +38,35 @@
       enabled: false,
       provider: 'deepseek',
       baseUrl: 'https://api.deepseek.com/v1',
+      defaultModel: 'deepseek-chat',
       apiKey: '',
       model: 'deepseek-chat',
       aggressiveScan: false,
     },
   };
 
-  function normalizeUidList(list) {
+  /**
+   * Supports both numeric UIDs ("123456") and @nickname entries ("@某某" or "n:某某").
+   */
+  function normalizeIdentityList(list) {
     if (!Array.isArray(list)) return [];
     const seen = new Set();
     const out = [];
     for (const item of list) {
-      const s = String(item || '').trim();
-      if (/^\d+$/.test(s) && !seen.has(s)) {
-        seen.add(s);
-        out.push(s);
+      let s = String(item || '').trim();
+      if (!s) continue;
+      if (/^\d+$/.test(s)) {
+        if (!seen.has(s)) {
+          seen.add(s);
+          out.push(s);
+        }
+      } else {
+        if (s.startsWith('n:')) s = `@${s.slice(2).trim()}`;
+        else if (!s.startsWith('@')) s = `@${s}`;
+        if (s.length > 1 && !seen.has(s)) {
+          seen.add(s);
+          out.push(s);
+        }
       }
     }
     return out;
@@ -72,6 +86,24 @@
     return out;
   }
 
+  function compileCustomRule(patternStr) {
+    const trimmed = String(patternStr || '').trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith('/') && trimmed.lastIndexOf('/') > 1) {
+      const lastSlash = trimmed.lastIndexOf('/');
+      const body = trimmed.slice(1, lastSlash);
+      const flags = trimmed.slice(lastSlash + 1).replace(/[^gimsuy]/g, '');
+      try {
+        return { re: new RegExp(body, flags), label: trimmed };
+      } catch (_err) {
+        return null;
+      }
+    }
+    return { plain: trimmed.toLowerCase(), label: trimmed };
+  }
+
+  let settingsSeq = 1;
+
   function normalizeSettings(partial) {
     const src = partial && typeof partial === 'object' ? partial : {};
     const cats = src.categories && typeof src.categories === 'object' ? src.categories : {};
@@ -89,6 +121,9 @@
         ? []
         : normalizeKeywordList(rules.BUILTIN_PRESET_KEYWORDS || []);
 
+    const whitelistUids = normalizeIdentityList(src.whitelistUids);
+    const blacklistUids = normalizeIdentityList(src.blacklistUids);
+
     const normalized = {
       enabled: src.enabled !== false,
       displayMode,
@@ -102,8 +137,8 @@
         ai_summon: cats.ai_summon !== false,
       },
       customKeywords,
-      whitelistUids: normalizeUidList(src.whitelistUids),
-      blacklistUids: normalizeUidList(src.blacklistUids),
+      whitelistUids,
+      blacklistUids,
       llm: {
         enabled: Boolean(llmSrc.enabled),
         provider: String(llmSrc.provider || DEFAULT_SETTINGS.llm.provider),
@@ -119,23 +154,8 @@
       value: customKeywords.map(compileCustomRule).filter(Boolean),
       enumerable: false,
     });
+    Object.defineProperty(normalized, '__id', { value: settingsSeq++, enumerable: false });
     return normalized;
-  }
-
-  function compileCustomRule(patternStr) {
-    const trimmed = String(patternStr || '').trim();
-    if (!trimmed) return null;
-    if (trimmed.startsWith('/') && trimmed.lastIndexOf('/') > 1) {
-      const lastSlash = trimmed.lastIndexOf('/');
-      const body = trimmed.slice(1, lastSlash);
-      const flags = trimmed.slice(lastSlash + 1).replace(/[^gimsuy]/g, '');
-      try {
-        return { re: new RegExp(body, flags), label: trimmed };
-      } catch (_err) {
-        return null;
-      }
-    }
-    return { plain: trimmed.toLowerCase(), label: trimmed };
   }
 
   const TIER1_SET = new Set(rules.DEEPSEEK_TIER1_BUZZWORDS || []);
@@ -156,6 +176,44 @@
 
   function getCategoryLabel(catId) {
     return (rules.CATEGORY_META[catId] && rules.CATEGORY_META[catId].shortLabel) || 'AI疑似';
+  }
+
+  function matchesIdentityList(list, uid, uname) {
+    if (!Array.isArray(list) || list.length === 0) return false;
+    if (uid && list.includes(uid)) return true;
+    if (uname && list.includes(`@${uname}`)) return true;
+    return false;
+  }
+
+  /**
+   * Checks whether `message` quotes a 2-10 char phrase from `parentMessage` inside 「...」 or “...”
+   * (classic DeepSeek 2.0 lexical-echo ping-pong behavior).
+   */
+  function hasLexicalQuoteEcho(message, parentMessage) {
+    if (!message || !parentMessage || parentMessage.length < 6) return false;
+    const quoteRe = /(?:「([^」\n]{2,10})」|“([^”\n]{2,10})”)/g;
+    let m;
+    while ((m = quoteRe.exec(message)) !== null) {
+      const term = (m[1] || m[2] || '').trim();
+      if (term.length >= 2 && parentMessage.includes(term)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Fast bounded LRU memoization cache for pure comment evaluations
+  const MAX_EVAL_CACHE = 1500;
+  const evalCache = new Map();
+
+  function cacheResult(key, res) {
+    if (!key) return res;
+    if (evalCache.size >= MAX_EVAL_CACHE) {
+      const oldest = evalCache.keys().next().value;
+      evalCache.delete(oldest);
+    }
+    evalCache.set(key, res);
+    return res;
   }
 
   function evaluateComment(comment, rawSettings, context = {}) {
@@ -179,51 +237,69 @@
     const sign = String(comment.sign || '').trim();
     const message = String(comment.message || '').trim();
     const ctime = Number(comment.ctime) || 0;
+    const level = Number(comment.level) || 0;
 
     const currentUserUid = context.currentUserUid ? String(context.currentUserUid).trim() : '';
     const upperUid = context.upperUid ? String(context.upperUid).trim() : '';
 
-    // Priority 0: Self, UP主, and manual Whitelist protection
-    if (uid) {
-      if (currentUserUid && uid === currentUserUid) {
-        return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
-      }
-      if (settings.protectUpper && upperUid && uid === upperUid) {
-        return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
-      }
-      if (settings.whitelistUids.includes(uid)) {
-        return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
-      }
+    // Priority 0: Self, UP主, and manual Whitelist (by UID or @uname) protection
+    if (uid && currentUserUid && uid === currentUserUid) {
+      return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
     }
-
-    // Protect real humans asking "你们都是deepseek吗？"
-    if (message && /(?:你们都是\s*deepseek\s*吗|全是\s*(?:ai|deepseek|机器人|人机)|两个\s*(?:ai|机器人)\s*在)/i.test(message)) {
+    if (uid && settings.protectUpper && upperUid && uid === upperUid) {
+      return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
+    }
+    if (matchesIdentityList(settings.whitelistUids, uid, uname)) {
       return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
     }
 
-    // Priority 1: Manual Blacklist & Confirmed Session AI UID cache
-    if (uid && settings.blacklistUids.includes(uid)) {
+    // Protect real humans calling out AI bots ("你们都是deepseek吗？", "？哪来的懒鱼？")
+    if (message && rules.HUMAN_CALLOUT_IMMUNITY_RE && rules.HUMAN_CALLOUT_IMMUNITY_RE.test(message)) {
+      return { action: 'allow', score: 0, threshold, primaryCategory: null, categoryLabel: null, reasons: [], confirmUidAsBot: false };
+    }
+
+    // Priority 1: Manual Blacklist & Confirmed Session AI UID/Uname cache
+    if (matchesIdentityList(settings.blacklistUids, uid, uname)) {
       return {
         action: 'block',
         score: 100,
         threshold,
         primaryCategory: 'blacklist',
         categoryLabel: getCategoryLabel('blacklist'),
-        reasons: ['手动黑名单UID'],
+        reasons: ['手动黑名单账号'],
         confirmUidAsBot: true,
       };
     }
 
-    if (uid && context.confirmedBotUids && context.confirmedBotUids.has(uid)) {
+    if (
+      context.confirmedBotUids &&
+      ((uid && context.confirmedBotUids.has(uid)) ||
+        (uname && context.confirmedBotUids.has(`n:${uname}`)))
+    ) {
       return {
         action: 'block',
         score: 95,
         threshold,
         primaryCategory: 'bio_agent',
         categoryLabel: getCategoryLabel('bio_agent'),
-        reasons: ['同账号在本页已实锤为AI号'],
+        reasons: ['同账号已被实锤为AI挂机号'],
         confirmUidAsBot: true,
       };
+    }
+
+    const parentThreadIsAi = Boolean(context.parentThreadIsAi);
+    const parentMessage = String(context.parentMessage || '');
+    const threadBotCadence = Boolean(context.threadBotCadence);
+    const videoPubdate = Number(context.videoPubdate) || 0;
+    const hasAtNames = Array.isArray(comment.atNames) && comment.atNames.length > 0;
+
+    // Check LRU cache when no dynamic atNames/pubdate edge applies
+    const canMemo = !hasAtNames && !(ctime > 0 && videoPubdate > 0) && !parentMessage;
+    const cacheKey = canMemo
+      ? `${settings.__id}|${settings.whitelistUids.length}|${settings.blacklistUids.length}|${uid}|${uname}|${level}|${sign}|${parentThreadIsAi ? 1 : 0}|${threadBotCadence ? 1 : 0}|${message}`
+      : '';
+    if (cacheKey && evalCache.has(cacheKey)) {
+      return evalCache.get(cacheKey);
     }
 
     const categoryScores = {
@@ -245,17 +321,19 @@
       if (confirmUid) confirmUidAsBot = true;
     };
 
-    // Category 1: 大肥鱼 / 鲸鱼娘 / 赛博鱼塘 / 养鱼 2.0 人设
+    // Category 1: 大肥鱼 / 哦鲸鲸 / 赛博鱼塘 / 养鱼 2.0 人设
     if (settings.categories.persona_dafeiyu) {
       const profileBlob = `${uname} ${sign}`;
       for (const item of rules.DAFEIYU_PROFILE_PATTERNS) {
         if (item.re.test(profileBlob)) {
-          addHit('persona_dafeiyu', item.score, item.reason, true, true);
+          addHit('persona_dafeiyu', item.score, item.reason, item.score >= 65, Boolean(item.confirmUid));
         }
       }
-      for (const item of rules.DAFEIYU_TEXT_PATTERNS) {
-        if (item.re.test(message)) {
-          addHit('persona_dafeiyu', item.score, item.reason, item.score >= 65, item.score >= 70);
+      if (message) {
+        for (const item of rules.DAFEIYU_TEXT_PATTERNS) {
+          if (item.re.test(message)) {
+            addHit('persona_dafeiyu', item.score, item.reason, item.score >= 65, item.score >= 70);
+          }
         }
       }
     }
@@ -283,7 +361,7 @@
     // Category 4: @AI 召唤刷屏指令
     if (settings.categories.ai_summon && message) {
       let summonText = message;
-      if (Array.isArray(comment.atNames) && comment.atNames.length > 0) {
+      if (hasAtNames) {
         const extraMentions = comment.atNames.map((n) => `@${n}`).join(' ');
         summonText = `${extraMentions} ${message}`;
       }
@@ -294,7 +372,7 @@
       }
     }
 
-    // Category 3: 伪装路人的 DeepSeek 腔调 / 双簧互吹 / 秒评课代表
+    // Category 3: 伪装路人的 DeepSeek 腔调 / 双簧互吹 / 秒评课代表 / 句法指纹
     if (settings.categories.deepseek_style && message) {
       for (const item of rules.DEEPSEEK_HARD_PATTERNS) {
         if (item.re.test(message)) {
@@ -315,9 +393,12 @@
 
       // DeepSeek 2.0 伪口语：破折号(——) + 比较/捧场/结论句式组合
       if (message.includes('——')) {
-        const hasComparisonTail = /(?:比(?:只写|一口气|一开始)[^，。！？\n]{1,16}(?:高得多|省力|实在|强)|回头(?:真不知道|能看见|纠正的成本))/.test(message);
+        const hasComparisonTail =
+          /(?:比(?:只写|光写|一口气|一开始|直接)[^，。！？\n]{1,16}(?:高得多|省力|实在|强|稳)|回头(?:真不知道|能看见|纠正的成本))/.test(
+            message
+          );
         if (hasComparisonTail) {
-          addHit('deepseek_style', 32, '破折号(——)搭配“回头…比…实在/高得多”AI句式', false, false);
+          addHit('deepseek_style', 32, '破折号(——)搭配“回头…比…实在/稳”AI句式', false, false);
         }
       }
 
@@ -362,7 +443,6 @@
       }
 
       // Speed-of-light long structured comment right after video publication
-      const videoPubdate = Number(context.videoPubdate) || 0;
       if (ctime > 0 && videoPubdate > 0 && ctime >= videoPubdate) {
         const deltaSec = ctime - videoPubdate;
         if (deltaSec <= 90 && message.length >= 75) {
@@ -372,11 +452,23 @@
         }
       }
 
-      // Thread context boost: if replying inside an already-confirmed AI thread with echo/agreement style
-      if (context.parentThreadIsAi && message.length >= 22) {
-        if (/^(?:这条最该置顶|对[，,]|太对了[，,]|确实[，,])/.test(message) || message.includes('——') || message.includes('「')) {
+      // Thread context boost: AI parent thread echo + lexical quote ping-pong + robotic cadence
+      if (parentThreadIsAi && message.length >= 20) {
+        if (
+          /^(?:这条最该置顶|对[，,]|太对了[，,]|确实[，,])/.test(message) ||
+          message.includes('——') ||
+          message.includes('「')
+        ) {
           addHit('deepseek_style', 35, '在AI主楼下使用AI句式捧场双簧', true, true);
         }
+      }
+
+      if (parentMessage && hasLexicalQuoteEcho(message, parentMessage) && (message.includes('——') || rhetoricHits > 0 || message.length >= 25)) {
+        addHit('deepseek_style', 28, '提取前文词句加引号接话双簧', false, false);
+      }
+
+      if (threadBotCadence && message.length >= 24 && (rhetoricHits > 0 || message.includes('——') || message.includes('「'))) {
+        addHit('deepseek_style', 20, '楼中楼高频机械间隔接话节奏', false, false);
       }
 
       // Textbook punctuation polish bonus
@@ -390,14 +482,20 @@
       }
     }
 
-    // Priority 1.5: Built-in Preset & Custom user keywords / regexes
-    // Evaluated after built-in categories so if it didn't already hit, preset/custom keyword catches it
     let totalScore =
       categoryScores.persona_dafeiyu +
       categoryScores.bio_agent +
       categoryScores.deepseek_style +
       categoryScores.ai_summon;
 
+    // Contextual low-level account boost: ONLY triggers if comment ALREADY has >= 24 pts of AI traits
+    // Never affects normal LV1/LV2 human users (whose score is 0)
+    if (level > 0 && level <= 2 && totalScore >= 24) {
+      totalScore += 10;
+      reasons.push(`LV${level}低等级号叠加AI特征`);
+    }
+
+    // Priority 1.5: Built-in Preset & Custom user keywords / regexes
     if (totalScore < threshold && settings.customKeywords.length > 0) {
       const compiledList =
         settings.__compiledKeywords || settings.customKeywords.map(compileCustomRule).filter(Boolean);
@@ -406,7 +504,7 @@
       for (const compiled of compiledList) {
         const matched = compiled.re ? compiled.re.test(combinedRaw) : combinedLower.includes(compiled.plain);
         if (matched) {
-          return {
+          return cacheResult(cacheKey, {
             action: 'block',
             score: 100,
             threshold,
@@ -414,7 +512,7 @@
             categoryLabel: getCategoryLabel('custom_keyword'),
             reasons: [`命中屏蔽词: ${compiled.label}`],
             confirmUidAsBot: true,
-          };
+          });
         }
       }
     }
@@ -422,7 +520,8 @@
     // Human colloquialism safeguard (only when NO hard evidence exists)
     if (!hasHardEvidence && totalScore > 0 && message) {
       if (rules.HUMAN_COLLOQUIAL_RE.test(message) || rules.MULTI_BILI_EMOJI_RE.test(message)) {
-        totalScore = Math.max(0, totalScore - 24);
+        const deduction = level >= 5 ? 30 : 24;
+        totalScore = Math.max(0, totalScore - deduction);
       }
     }
 
@@ -435,12 +534,12 @@
       }
     }
 
-    if (totalScore >= 70) {
+    if (totalScore >= 72) {
       confirmUidAsBot = true;
     }
 
     if (totalScore >= threshold) {
-      return {
+      return cacheResult(cacheKey, {
         action: 'block',
         score: totalScore,
         threshold,
@@ -448,7 +547,7 @@
         categoryLabel: getCategoryLabel(primaryCategory || 'deepseek_style'),
         reasons,
         confirmUidAsBot,
-      };
+      });
     }
 
     const llmReady = Boolean(settings.llm.enabled && settings.llm.apiKey && settings.llm.baseUrl);
@@ -460,7 +559,7 @@
         !rules.HUMAN_COLLOQUIAL_RE.test(message);
 
       if (inGrayZone || inAggressiveZone) {
-        return {
+        return cacheResult(cacheKey, {
           action: 'pending_llm',
           score: totalScore,
           threshold,
@@ -468,11 +567,11 @@
           categoryLabel: getCategoryLabel(primaryCategory || 'deepseek_style'),
           reasons,
           confirmUidAsBot: false,
-        };
+        });
       }
     }
 
-    return {
+    return cacheResult(cacheKey, {
       action: 'allow',
       score: totalScore,
       threshold,
@@ -480,7 +579,7 @@
       categoryLabel: primaryCategory ? getCategoryLabel(primaryCategory) : null,
       reasons,
       confirmUidAsBot: false,
-    };
+    });
   }
 
   const exported = {
