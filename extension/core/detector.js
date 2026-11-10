@@ -89,7 +89,7 @@
         ? []
         : normalizeKeywordList(rules.BUILTIN_PRESET_KEYWORDS || []);
 
-    return {
+    const normalized = {
       enabled: src.enabled !== false,
       displayMode,
       sensitivity,
@@ -113,6 +113,13 @@
         aggressiveScan: Boolean(llmSrc.aggressiveScan),
       },
     };
+
+    Object.defineProperty(normalized, '__normalized', { value: true, enumerable: false });
+    Object.defineProperty(normalized, '__compiledKeywords', {
+      value: customKeywords.map(compileCustomRule).filter(Boolean),
+      enumerable: false,
+    });
+    return normalized;
   }
 
   function compileCustomRule(patternStr) {
@@ -152,7 +159,7 @@
   }
 
   function evaluateComment(comment, rawSettings, context = {}) {
-    const settings = normalizeSettings(rawSettings);
+    const settings = rawSettings && rawSettings.__normalized ? rawSettings : normalizeSettings(rawSettings);
     const threshold = SENSITIVITY_THRESHOLDS[settings.sensitivity] || SENSITIVITY_THRESHOLDS.standard;
 
     if (!settings.enabled || !comment) {
@@ -392,11 +399,11 @@
       categoryScores.ai_summon;
 
     if (totalScore < threshold && settings.customKeywords.length > 0) {
-      const combinedLower = `${uname}\n${sign}\n${message}`.toLowerCase();
+      const compiledList =
+        settings.__compiledKeywords || settings.customKeywords.map(compileCustomRule).filter(Boolean);
       const combinedRaw = `${uname}\n${sign}\n${message}`;
-      for (const kw of settings.customKeywords) {
-        const compiled = compileCustomRule(kw);
-        if (!compiled) continue;
+      const combinedLower = combinedRaw.toLowerCase();
+      for (const compiled of compiledList) {
         const matched = compiled.re ? compiled.re.test(combinedRaw) : combinedLower.includes(compiled.plain);
         if (matched) {
           return {

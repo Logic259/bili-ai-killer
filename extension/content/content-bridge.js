@@ -13,6 +13,8 @@
   let cachedSettings = null;
   let llmQueue = [];
   let llmTimer = null;
+  let blockedQueue = [];
+  let blockedTimer = null;
 
   function isContextValid() {
     try {
@@ -104,6 +106,21 @@
     }
   }
 
+  function flushBlockedBatch() {
+    blockedTimer = null;
+    if (blockedQueue.length === 0) return;
+    const entries = blockedQueue.splice(0, blockedQueue.length);
+    safeSendRuntimeMessage({ type: 'RECORD_BLOCKED_BATCH', entries });
+  }
+
+  function enqueueBlockedEntry(entry) {
+    if (!entry) return;
+    blockedQueue.push(entry);
+    if (!blockedTimer) {
+      blockedTimer = setTimeout(flushBlockedBatch, 120);
+    }
+  }
+
   // Listen to events emitted by MAIN world
   document.documentElement.addEventListener(EVT_TO_ISOLATED, (ev) => {
     if (!ev || typeof ev.detail !== 'string') return;
@@ -123,11 +140,16 @@
 
         case 'PAGE_RESET':
           llmQueue = [];
+          blockedQueue = [];
+          if (blockedTimer) {
+            clearTimeout(blockedTimer);
+            blockedTimer = null;
+          }
           safeSendRuntimeMessage({ type: 'TAB_RESET', url: (msg.payload && msg.payload.url) || location.href });
           break;
 
         case 'COMMENT_BLOCKED':
-          safeSendRuntimeMessage({ type: 'RECORD_BLOCKED', entry: msg.payload });
+          enqueueBlockedEntry(msg.payload);
           break;
 
         case 'ADD_WHITELIST_UID':

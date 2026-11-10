@@ -170,10 +170,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         break;
       }
 
-      case 'RECORD_BLOCKED': {
+      case 'RECORD_BLOCKED':
+      case 'RECORD_BLOCKED_BATCH': {
         await enqueueRecordTask(async () => {
-          const entry = msg.entry;
-          if (!entry) return;
+          const entries =
+            msg.type === 'RECORD_BLOCKED_BATCH' && Array.isArray(msg.entries)
+              ? msg.entries
+              : msg.entry
+                ? [msg.entry]
+                : [];
+          if (entries.length === 0) return;
 
           const [settings, tabState, stats] = await Promise.all([
             getSettings(),
@@ -181,12 +187,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             getStats(),
           ]);
 
-          tabState.count = (Number(tabState.count) || 0) + 1;
-          tabState.logs = [entry, ...(tabState.logs || [])].slice(0, MAX_TAB_LOGS);
+          tabState.count = (Number(tabState.count) || 0) + entries.length;
+          tabState.logs = [...entries.slice().reverse(), ...(tabState.logs || [])].slice(0, MAX_TAB_LOGS);
 
-          stats.totalBlocked = (Number(stats.totalBlocked) || 0) + 1;
-          const cat = entry.category || 'deepseek_style';
-          stats.byCategory[cat] = (Number(stats.byCategory[cat]) || 0) + 1;
+          stats.totalBlocked = (Number(stats.totalBlocked) || 0) + entries.length;
+          for (const entry of entries) {
+            const cat = (entry && entry.category) || 'deepseek_style';
+            stats.byCategory[cat] = (Number(stats.byCategory[cat]) || 0) + 1;
+          }
 
           await Promise.all([
             setTabState(senderTabId, tabState),

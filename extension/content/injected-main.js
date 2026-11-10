@@ -32,6 +32,7 @@
 
   let currentSettings = detector.normalizeSettings(detector.DEFAULT_SETTINGS);
   let settingsEpoch = 1;
+  let apiEpoch = 1;
 
   const pageContext = {
     currentUserUid: '',
@@ -213,9 +214,9 @@
         indexRawReplyObject(data.root);
       }
 
+      apiEpoch += 1;
       scheduleReevaluateTracked(true);
-      setTimeout(() => scheduleReevaluateTracked(true), 80);
-      setTimeout(() => scheduleReevaluateTracked(true), 250);
+      setTimeout(() => scheduleReevaluateTracked(true), 140);
     }
   }
 
@@ -371,7 +372,7 @@
   }
 
   /**
-   * Extracts uid, uname, and comment message from a renderer's Shadow DOM.
+   * Extracts uid, uname, and comment message from a renderer's Shadow DOM without querySelectorAll('*').
    * Ensures @mentions inside <bili-rich-text> are NEVER mistaken for the comment author's uname/uid.
    */
   function extractShadowDomFallback(rendererEl) {
@@ -379,6 +380,7 @@
     let uid = '';
     let uname = '';
     let message = '';
+    let contentNode = null;
 
     const extractAuthorFromRoot = (root) => {
       if (!root || !root.querySelectorAll) return;
@@ -402,53 +404,56 @@
       }
     };
 
-    const walkShadow = (root, depth, insideRichText) => {
-      if (!root || depth > 5) return;
+    const inspectRendererRoot = (root) => {
+      if (!root || !root.querySelector) return;
 
-      if (insideRichText) {
-        if (!message) {
-          const contentsEl = (root.querySelector && root.querySelector('#contents')) || root;
-          message = extractTextWithAlt(contentsEl);
-        }
-        return;
-      }
-
-      // Check <bili-comment-user-info> first for accurate author identity
-      const userInfoEl = root.querySelector && root.querySelector('bili-comment-user-info');
+      // 1. Author identity strictly from <bili-comment-user-info> or direct header anchors
+      const userInfoEl = root.querySelector('bili-comment-user-info');
       if (userInfoEl && userInfoEl.shadowRoot) {
-        ensureObserved(userInfoEl.shadowRoot);
         extractAuthorFromRoot(userInfoEl.shadowRoot);
       }
       if (!uid || !uname) {
         extractAuthorFromRoot(root);
       }
 
-      // Check <bili-rich-text> for comment body
-      const richEl = root.querySelector && root.querySelector('bili-rich-text');
+      // 2. Comment body from <bili-rich-text> or direct #contents
+      const richEl = root.querySelector('bili-rich-text');
       if (richEl && richEl.shadowRoot) {
-        ensureObserved(richEl.shadowRoot);
         const contentsEl = richEl.shadowRoot.querySelector('#contents') || richEl.shadowRoot;
         const richMsg = extractTextWithAlt(contentsEl);
-        if (richMsg) message = richMsg;
+        if (richMsg) {
+          message = richMsg;
+          contentNode = contentsEl;
+        }
+      }
+      if (!message) {
+        const directContent = root.querySelector('#contents, #content-text, .reply-content');
+        if (directContent) {
+          const directMsg = extractTextWithAlt(directContent);
+          if (directMsg) {
+            message = directMsg;
+            contentNode = directContent;
+          }
+        }
       }
 
-      const children = root.querySelectorAll ? root.querySelectorAll('*') : [];
-      for (const child of children) {
-        if (
-          child.shadowRoot &&
-          child.tagName !== 'BILI-COMMENT-REPLIES-RENDERER' &&
-          child.tagName !== 'BILI-COMMENT-REPLY-RENDERER'
-        ) {
-          ensureObserved(child.shadowRoot);
-          walkShadow(child.shadowRoot, depth + 1, child.tagName === 'BILI-RICH-TEXT');
+      // 3. If a nested <bili-comment-renderer> exists inside this root, inspect it directly
+      if (!message || (!uid && !uname)) {
+        const nestedRenderer = root.querySelector('bili-comment-renderer');
+        if (nestedRenderer && nestedRenderer.shadowRoot) {
+          inspectRendererRoot(nestedRenderer.shadowRoot);
         }
       }
     };
 
-    walkShadow(rendererEl.shadowRoot, 0, false);
+    inspectRendererRoot(rendererEl.shadowRoot);
 
     if (!uid && !uname && !message) return null;
-    return { rpid: '', uid, uname, sign: '', message, ctime: 0, atNames: [] };
+    const res = { rpid: '', uid, uname, sign: '', message, ctime: 0, atNames: [] };
+    if (contentNode) {
+      Object.defineProperty(res, '__contentNode', { value: contentNode, enumerable: false });
+    }
+    return res;
   }
 
   function resolveCommentMeta(rendererEl, threadEl) {
@@ -662,14 +667,19 @@
     }
 
     if (currentSettings.displayMode === 'hide') {
-      hostEl.setAttribute('data-bak-state', 'hidden');
-      hostEl.style.setProperty('display', 'none', 'important');
+      if (hostEl.getAttribute('data-bak-state') !== 'hidden') {
+        hostEl.setAttribute('data-bak-state', 'hidden');
+      }
+      if (!hostEl.style || hostEl.style.display !== 'none') {
+        hostEl.style.setProperty('display', 'none', 'important');
+      }
     } else {
       if (hostEl.style && hostEl.style.display === 'none') {
         hostEl.style.removeProperty('display');
       }
       ensureCollapseBanner(hostEl, meta, evalResult);
-      if (hostEl.getAttribute('data-bak-state') !== 'expanded') {
+      const curState = hostEl.getAttribute('data-bak-state');
+      if (curState !== 'expanded' && curState !== 'collapsed') {
         hostEl.setAttribute('data-bak-state', 'collapsed');
       }
     }
@@ -698,22 +708,55 @@
       return;
     }
 
-    const freshMeta = resolveCommentMeta(entry.rendererEl, entry.isThread ? hostEl : null);
-    if (freshMeta) {
-      const newIdKey = getMetaIdentityKey(freshMeta);
-      if (entry.identityKey && newIdKey && entry.identityKey !== newIdKey) {
-        restoreHost(hostEl);
-        entry.lastEvalKey = '';
-        entry.lastResult = null;
+    // Fast O(1) dirty-check: skip DOM traversal if comment is already extracted and unchanged
+    let needResolve = !entry.meta || !entry.meta.message || entry.lastApiEpoch !== apiEpoch;
+    if (!needResolve) {
+      const rawPayload =
+        extractLitCommentPayload(entry.rendererEl) ||
+        (entry.isThread ? extractLitCommentPayload(hostEl) : null);
+      if (rawPayload) {
+        const rawRpid = String(rawPayload.rpid_str || rawPayload.rpid || '').trim();
+        if (rawRpid && entry.meta.rpid && rawRpid !== entry.meta.rpid) {
+          needResolve = true;
+        }
+      } else if (entry.contentNode && entry.contentNode.isConnected) {
+        const curText = entry.contentNode.textContent || '';
+        if (curText && curText !== entry.lastDomText) {
+          needResolve = true;
+        }
       }
-      entry.meta = freshMeta;
-      entry.identityKey = newIdKey;
-    } else if (entry.meta && entry.meta.rpid && !entry.meta.sign && metaByRpid.has(entry.meta.rpid)) {
-      entry.meta = metaByRpid.get(entry.meta.rpid);
+    }
+
+    if (needResolve) {
+      const freshMeta = resolveCommentMeta(entry.rendererEl, entry.isThread ? hostEl : null);
+      if (freshMeta) {
+        if (freshMeta.__contentNode) {
+          entry.contentNode = freshMeta.__contentNode;
+          entry.lastDomText = freshMeta.__contentNode.textContent || '';
+        }
+        const newIdKey = getMetaIdentityKey(freshMeta);
+        if (entry.identityKey && newIdKey && entry.identityKey !== newIdKey) {
+          restoreHost(hostEl);
+          entry.lastEvalKey = '';
+          entry.lastResult = null;
+        }
+        entry.meta = freshMeta;
+        entry.identityKey = newIdKey;
+        entry.lastApiEpoch = apiEpoch;
+      } else if (entry.meta && entry.meta.rpid && !entry.meta.sign && metaByRpid.has(entry.meta.rpid)) {
+        entry.meta = metaByRpid.get(entry.meta.rpid);
+        entry.lastApiEpoch = apiEpoch;
+      }
     }
 
     const meta = entry.meta;
-    if (!meta || (!meta.message && !meta.uname && !meta.sign)) return;
+    if (!meta || (!meta.message && !meta.uname && !meta.sign)) {
+      if ((entry.retryCount || 0) < 3) {
+        entry.retryCount = (entry.retryCount || 0) + 1;
+        setTimeout(() => evaluateAndActOnEntry(hostEl, entry), entry.retryCount * 50);
+      }
+      return;
+    }
 
     if (!currentSettings.enabled) {
       restoreHost(hostEl);
@@ -747,7 +790,9 @@
       return;
     }
 
-    refreshInitialStateContext();
+    if (!pageContext.upperUid || !pageContext.videoPubdate) {
+      refreshInitialStateContext();
+    }
 
     // If this username was already confirmed as a bot even without UID, mark uid in context
     const effectiveContext = {
@@ -827,16 +872,21 @@
   }
 
   let reevalScheduled = false;
+  let pendingFullRescan = false;
   function scheduleReevaluateTracked(forceFullRescan = false) {
+    if (forceFullRescan) pendingFullRescan = true;
     if (reevalScheduled) return;
     reevalScheduled = true;
     queueMicrotask(() => {
       reevalScheduled = false;
-      if (forceFullRescan) {
+      const doFull = pendingFullRescan;
+      pendingFullRescan = false;
+      if (doFull) {
         scanBiliCommentsTree();
-      }
-      for (const [hostEl, entry] of trackedHosts.entries()) {
-        evaluateAndActOnEntry(hostEl, entry);
+      } else {
+        for (const [hostEl, entry] of trackedHosts.entries()) {
+          evaluateAndActOnEntry(hostEl, entry);
+        }
       }
     });
   }
@@ -847,18 +897,18 @@
 
     const mainCommentRenderer = threadEl.shadowRoot.querySelector('bili-comment-renderer');
     if (mainCommentRenderer) {
-      if (mainCommentRenderer.shadowRoot) {
-        ensureObserved(mainCommentRenderer.shadowRoot);
-      }
       let entry = trackedHosts.get(threadEl);
       if (!entry) {
-        const initialMeta = resolveCommentMeta(mainCommentRenderer, threadEl);
         entry = {
           rendererEl: mainCommentRenderer,
           parentThreadEl: null,
           isThread: true,
-          meta: initialMeta,
-          identityKey: getMetaIdentityKey(initialMeta),
+          meta: null,
+          contentNode: null,
+          lastDomText: '',
+          lastApiEpoch: 0,
+          retryCount: 0,
+          identityKey: '',
           lastEvalKey: '',
           lastResult: null,
         };
@@ -881,9 +931,6 @@
 
   function processReplyRenderer(replyEl, parentThreadEl = null) {
     if (!replyEl) return;
-    if (replyEl.shadowRoot) {
-      ensureObserved(replyEl.shadowRoot);
-    }
     let resolvedParentThread = parentThreadEl;
     if (!resolvedParentThread) {
       const owner = findOwningCommentHost(replyEl.getRootNode && replyEl.getRootNode());
@@ -894,13 +941,16 @@
 
     let entry = trackedHosts.get(replyEl);
     if (!entry) {
-      const initialMeta = resolveCommentMeta(replyEl, null);
       entry = {
         rendererEl: replyEl,
         parentThreadEl: resolvedParentThread,
         isThread: false,
-        meta: initialMeta,
-        identityKey: getMetaIdentityKey(initialMeta),
+        meta: null,
+        contentNode: null,
+        lastDomText: '',
+        lastApiEpoch: 0,
+        retryCount: 0,
+        identityKey: '',
         lastEvalKey: '',
         lastResult: null,
       };
@@ -926,8 +976,10 @@
 
   function inspectNodeTree(rootNode) {
     if (!rootNode) return;
+    let isBiliCustomTag = false;
     if (rootNode.nodeType === Node.ELEMENT_NODE) {
-      const tag = rootNode.tagName;
+      const tag = rootNode.tagName || '';
+      isBiliCustomTag = tag.startsWith('BILI-');
       if (tag === 'BILI-COMMENTS') {
         if (rootNode.shadowRoot) {
           ensureObserved(rootNode.shadowRoot);
@@ -935,41 +987,55 @@
         }
       } else if (tag === 'BILI-COMMENT-THREAD-RENDERER') {
         processThreadRenderer(rootNode);
+        return;
       } else if (tag === 'BILI-COMMENT-REPLIES-RENDERER') {
         if (rootNode.shadowRoot) {
           ensureObserved(rootNode.shadowRoot);
           inspectNodeTree(rootNode.shadowRoot);
         }
+        return;
       } else if (tag === 'BILI-COMMENT-REPLY-RENDERER') {
         processReplyRenderer(rootNode);
+        return;
       } else if (tag === 'BILI-COMMENT-RENDERER') {
-        if (rootNode.shadowRoot) ensureObserved(rootNode.shadowRoot);
         const hostRoot = rootNode.getRootNode && rootNode.getRootNode();
         if (hostRoot && hostRoot.host && hostRoot.host.tagName === 'BILI-COMMENT-THREAD-RENDERER') {
           processThreadRenderer(hostRoot.host);
         }
+        return;
       } else if (tag === 'BILI-RICH-TEXT' || tag === 'BILI-COMMENT-USER-INFO') {
-        if (rootNode.shadowRoot) {
-          ensureObserved(rootNode.shadowRoot);
-          const owningHost = findOwningCommentHost(rootNode.shadowRoot);
-          if (owningHost) {
-            if (owningHost.tagName === 'BILI-COMMENT-REPLY-RENDERER') {
-              processReplyRenderer(owningHost);
-            } else {
-              processThreadRenderer(owningHost);
-            }
+        const owningHost = findOwningCommentHost(rootNode.getRootNode && rootNode.getRootNode());
+        if (owningHost) {
+          if (owningHost.tagName === 'BILI-COMMENT-REPLY-RENDERER') {
+            processReplyRenderer(owningHost);
+          } else {
+            processThreadRenderer(owningHost);
           }
         }
+        return;
       }
+    }
+
+    // Skip expensive querySelectorAll on leaf elements (e.g. <span>, <a>, <img>, <p>)
+    if (
+      !isBiliCustomTag &&
+      rootNode.nodeType === Node.ELEMENT_NODE &&
+      rootNode.childNodes &&
+      rootNode.childNodes.length === 0
+    ) {
+      return;
     }
 
     if (rootNode.querySelectorAll) {
       const candidates = rootNode.querySelectorAll(
-        'bili-comments, bili-comment-thread-renderer, bili-comment-renderer, bili-comment-replies-renderer, bili-comment-reply-renderer, bili-rich-text, bili-comment-user-info'
+        'bili-comments, bili-comment-thread-renderer, bili-comment-replies-renderer, bili-comment-reply-renderer'
       );
       for (const el of candidates) {
-        if (el.shadowRoot) ensureObserved(el.shadowRoot);
-        if (el.tagName === 'BILI-COMMENT-THREAD-RENDERER') {
+        if (el.tagName === 'BILI-COMMENTS' && el.shadowRoot) {
+          ensureObserved(el.shadowRoot);
+        } else if (el.tagName === 'BILI-COMMENT-REPLIES-RENDERER' && el.shadowRoot) {
+          ensureObserved(el.shadowRoot);
+        } else if (el.tagName === 'BILI-COMMENT-THREAD-RENDERER') {
           processThreadRenderer(el);
         } else if (el.tagName === 'BILI-COMMENT-REPLY-RENDERER') {
           processReplyRenderer(el);
@@ -979,36 +1045,29 @@
   }
 
   /**
-   * Attaches MutationObserver to a shadowRoot ONCE, without blocking subsequent deep rescans.
+   * Attaches MutationObserver ONLY to container shadowRoots (bili-comments, thread, replies),
+   * avoiding hundreds of inner characterData observers on leaf nodes.
    */
   function ensureObserved(shadowRoot) {
     if (!shadowRoot || observedRoots.has(shadowRoot)) return;
     observedRoots.add(shadowRoot);
 
     const obs = new MutationObserver((mutations) => {
-      let needsOwnerCheck = false;
       for (const m of mutations) {
-        if (m.type === 'characterData') {
-          needsOwnerCheck = true;
-          continue;
-        }
         for (const added of m.addedNodes) {
           if (added.nodeType === Node.ELEMENT_NODE) {
+            if (
+              added.hasAttribute &&
+              (added.hasAttribute('data-bak-banner') || added.hasAttribute('data-bak-style'))
+            ) {
+              continue;
+            }
             inspectNodeTree(added);
-          } else if (added.nodeType === Node.TEXT_NODE) {
-            needsOwnerCheck = true;
           }
         }
       }
-      if (needsOwnerCheck) {
-        const owner = findOwningCommentHost(shadowRoot);
-        if (owner) {
-          const entry = trackedHosts.get(owner);
-          if (entry) evaluateAndActOnEntry(owner, entry);
-        }
-      }
     });
-    obs.observe(shadowRoot, { childList: true, subtree: true, characterData: true });
+    obs.observe(shadowRoot, { childList: true, subtree: true });
   }
 
   /**
@@ -1016,39 +1075,59 @@
    * even if their outer shadowRoot was already added to observedRoots when initially empty.
    */
   function scanBiliCommentsTree() {
-    if (!document || !document.querySelectorAll) return;
+    if (!document || !document.querySelectorAll) return false;
     const allCommentRoots = document.querySelectorAll('bili-comments');
+    let foundReadyRoot = false;
     for (const bc of allCommentRoots) {
       if (!bc.shadowRoot) continue;
+      foundReadyRoot = true;
       ensureObserved(bc.shadowRoot);
       const threads = bc.shadowRoot.querySelectorAll('bili-comment-thread-renderer');
       for (const threadEl of threads) {
         processThreadRenderer(threadEl);
       }
     }
+    return foundReadyRoot;
   }
 
+  let activeDocObs = null;
   function setupDocumentObserver() {
-    const target = document.body || document.documentElement;
-    if (!target || observedRoots.has(target)) return;
-    observedRoots.add(target);
+    if (scanBiliCommentsTree()) {
+      if (activeDocObs) {
+        activeDocObs.disconnect();
+        activeDocObs = null;
+      }
+      return;
+    }
 
-    const docObs = new MutationObserver((mutations) => {
+    const target = document.body || document.documentElement;
+    if (!target || activeDocObs) return;
+
+    let docCheckQueued = false;
+    activeDocObs = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const added of m.addedNodes) {
-          if (added.nodeType === Node.ELEMENT_NODE) {
-            if (
-              added.tagName === 'BILI-COMMENTS' ||
-              (added.querySelector && added.querySelector('bili-comments'))
-            ) {
-              inspectNodeTree(added);
+          if (added.nodeType === Node.ELEMENT_NODE && added.tagName === 'BILI-COMMENTS') {
+            inspectNodeTree(added);
+            if (added.shadowRoot && activeDocObs) {
+              activeDocObs.disconnect();
+              activeDocObs = null;
+              return;
             }
           }
         }
       }
+      if (docCheckQueued) return;
+      docCheckQueued = true;
+      setTimeout(() => {
+        docCheckQueued = false;
+        if (scanBiliCommentsTree() && activeDocObs) {
+          activeDocObs.disconnect();
+          activeDocObs = null;
+        }
+      }, 120);
     });
-    docObs.observe(target, { childList: true, subtree: true });
-    scanBiliCommentsTree();
+    activeDocObs.observe(target, { childList: true, subtree: true });
   }
 
   let scrollTimer = null;
@@ -1059,7 +1138,7 @@
       scrollTimer = setTimeout(() => {
         scrollTimer = null;
         scheduleReevaluateTracked(true);
-      }, 150);
+      }, 280);
     },
     { passive: true }
   );
@@ -1076,9 +1155,16 @@
       settingsEpoch += 1;
       refreshInitialStateContext();
       sendToBridge('PAGE_RESET', { url: location.href });
+      setupDocumentObserver();
+      return;
     }
-    scheduleReevaluateTracked(true);
-  }, 900);
+    if (!activeDocObs) {
+      const bc = document.querySelector && document.querySelector('bili-comments');
+      if (bc && bc.shadowRoot && !observedRoots.has(bc.shadowRoot)) {
+        scanBiliCommentsTree();
+      }
+    }
+  }, 1800);
 
   document.documentElement.addEventListener(EVT_TO_MAIN, (ev) => {
     if (!ev || typeof ev.detail !== 'string') return;
