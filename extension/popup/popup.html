@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>B站 AI 评论净化器</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <img src="../icons/icon48.png" alt="" class="brand-icon" />
+        <div>
+          <h1 class="brand-title">B站 AI 评论净化器</h1>
+          <p class="brand-sub" id="status-subtitle">实时守护评论区净土</p>
+        </div>
+      </div>
+      <label class="switch" title="开启或暂停净化">
+        <input type="checkbox" id="enabled-toggle" checked />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="stats-row">
+      <div class="stat-card accent-pink">
+        <span class="stat-label">当前页已净化</span>
+        <strong class="stat-value" id="stat-tab-count">0</strong>
+      </div>
+      <div class="stat-card accent-cyan">
+        <span class="stat-label">历史累计净化</span>
+        <strong class="stat-value" id="stat-total-count">0</strong>
+      </div>
+    </section>
+
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab-btn active" data-tab="rules">过滤策略</button>
+      <button type="button" class="tab-btn" data-tab="logs">
+        本页拦截 <span class="tab-pill" id="logs-pill">0</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="advanced">API 与名单</button>
+    </nav>
+
+    <!-- Tab 1: 过滤策略 -->
+    <main class="tab-panel active" id="panel-rules">
+      <div class="control-group">
+        <div class="group-header">
+          <span class="group-title">命中后处理方式</span>
+        </div>
+        <div class="segmented" id="display-mode-seg">
+          <button type="button" class="seg-btn active" data-value="hide">彻底消失（无痕）</button>
+          <button type="button" class="seg-btn" data-value="collapse">折叠单行提示</button>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <div class="group-header">
+          <span class="group-title">本地评分灵敏度</span>
+          <span class="group-hint" id="sensitivity-hint">阈值 55 · 平衡防误伤</span>
+        </div>
+        <div class="segmented" id="sensitivity-seg">
+          <button type="button" class="seg-btn" data-value="relaxed">宽松</button>
+          <button type="button" class="seg-btn active" data-value="standard">标准（推荐）</button>
+          <button type="button" class="seg-btn" data-value="strict">严格</button>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <div class="group-header">
+          <span class="group-title">目标类型开关</span>
+        </div>
+        <div class="rule-list">
+          <label class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-name">大肥鱼 / 鲸鱼娘 / 赛博鱼塘</span>
+              <span class="rule-desc">本鲸、吃白饭、讨Token、深海巡逻等挂机人设</span>
+            </div>
+            <input type="checkbox" class="cat-checkbox" data-cat="persona_dafeiyu" checked />
+          </label>
+
+          <label class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-name">简介 / 昵称自曝 AI Agent</span>
+              <span class="rule-desc">个人签名含 DeepSeek / AstrBot / OpenClaw / 自动回复</span>
+            </div>
+            <input type="checkbox" class="cat-checkbox" data-cat="bio_agent" checked />
+          </label>
+
+          <label class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-name">伪装路人的 DeepSeek 腔评论</span>
+              <span class="rule-desc">Markdown星号残留、排比升华对仗、八股词簇、光速课代表</span>
+            </div>
+            <input type="checkbox" class="cat-checkbox" data-cat="deepseek_style" checked />
+          </label>
+
+          <label class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-name">@AI 召唤刷屏楼层</span>
+              <span class="rule-desc">呼叫 @豆包 @评论罗伯特 @AI视频小助理 等省流指令</span>
+            </div>
+            <input type="checkbox" class="cat-checkbox" data-cat="ai_summon" checked />
+          </label>
+        </div>
+      </div>
+
+      <label class="inline-check">
+        <input type="checkbox" id="protect-upper-check" checked />
+        <span>自动保护当前视频 / 动态 UP 主本人的评论</span>
+      </label>
+    </main>
+
+    <!-- Tab 2: 本页拦截明细 -->
+    <main class="tab-panel" id="panel-logs">
+      <div class="logs-toolbar">
+        <span class="logs-tip">即使开启“彻底消失”，也可在此核查并一键加白恢复</span>
+      </div>
+      <div class="logs-list" id="logs-container">
+        <div class="empty-state">当前页面暂未发现 AI 评论</div>
+      </div>
+    </main>
+
+    <!-- Tab 3: API 二次精判与黑白名单 -->
+    <main class="tab-panel" id="panel-advanced">
+      <div class="card-section">
+        <div class="section-head">
+          <div>
+            <h2 class="section-title">API 批量二次精判（可选）</h2>
+            <p class="section-sub">对本地难以100%定性的高伪装灰区评论调用小模型复核</p>
+          </div>
+          <label class="switch switch-sm">
+            <input type="checkbox" id="llm-enabled-toggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="form-grid" id="llm-form-fields">
+          <label class="field">
+            <span>接口预设</span>
+            <select id="llm-provider">
+              <option value="deepseek">DeepSeek 官方 API</option>
+              <option value="siliconflow">硅基流动 (SiliconFlow)</option>
+              <option value="openai">OpenAI 兼容接口</option>
+              <option value="ollama">本地 Ollama (免Key)</option>
+              <option value="custom">自定义端点</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Base URL</span>
+            <input type="text" id="llm-base-url" placeholder="https://api.deepseek.com/v1" spellcheck="false" />
+          </label>
+
+          <label class="field">
+            <span>API Key（仅存本地沙盒）</span>
+            <input type="password" id="llm-api-key" placeholder="sk-..." autocomplete="off" spellcheck="false" />
+          </label>
+
+          <label class="field">
+            <span>模型名称 (Model)</span>
+            <input type="text" id="llm-model" placeholder="deepseek-chat" spellcheck="false" />
+          </label>
+
+          <label class="inline-check compact">
+            <input type="checkbox" id="llm-aggressive-check" />
+            <span>深度扫描（对 ≥45 字无明显口语的长评均做二次复核）</span>
+          </label>
+
+          <div class="btn-row">
+            <button type="button" class="btn btn-primary" id="save-llm-btn">保存并测试连接</button>
+          </div>
+          <div class="status-msg" id="llm-test-status"></div>
+        </div>
+      </div>
+
+      <div class="card-section">
+        <div class="group-header">
+          <h2 class="section-title">预设与自定义屏蔽词 / UID 名单</h2>
+          <button type="button" class="whitelist-mini-btn" id="restore-presets-btn" title="将内置推荐屏蔽词合并填入下方输入框">载入推荐预设词</button>
+        </div>
+        <label class="field">
+          <span>屏蔽词库（每行一条，支持关键字或 <code>/正则/i</code>，已内置 33 条高频词）</span>
+          <textarea id="custom-keywords-input" rows="5" placeholder="例如：&#10;本鲸&#10;吃白饭&#10;这条我收下了——&#10;/鱼才不会跑偏/"></textarea>
+        </label>
+
+        <div class="two-col">
+          <label class="field">
+            <span>白名单 UID（每行一个）</span>
+            <textarea id="whitelist-uids-input" rows="3" placeholder="永不拦截的UID"></textarea>
+          </label>
+          <label class="field">
+            <span>黑名单 UID（每行一个）</span>
+            <textarea id="blacklist-uids-input" rows="3" placeholder="直接封杀的UID"></textarea>
+          </label>
+        </div>
+
+        <div class="btn-row spread">
+          <button type="button" class="btn btn-ghost" id="clear-stats-btn">清空统计与缓存</button>
+          <button type="button" class="btn btn-primary" id="save-lists-btn">保存名单规则</button>
+        </div>
+        <div class="status-msg" id="lists-save-status"></div>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "B站 AI 评论净化器 (Bili-AI-Killer)",
+  "short_name": "Bili-AI-Killer",
+  "version": "1.0.0",
+  "description": "精准识别并彻底屏蔽 B 站评论区接入 DeepSeek 的大肥鱼/鲸鱼娘挂机号、签名自曝 Agent、伪装路人锐评腔与 @AI 召唤刷屏。",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "*://*.bilibili.com/*",
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "B站 AI 评论净化器",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.bilibili.com/*"],
+      "js": ["content/content-bridge.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": ["*://*.bilibili.com/*"],
+      "js": [
+        "core/rules.js",
+        "core/detector.js",
+        "content/injected-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}
